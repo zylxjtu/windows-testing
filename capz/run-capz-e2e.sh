@@ -7,6 +7,9 @@ set -o functrace
 
 SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]}")
 SCRIPT_ROOT=$(dirname "${SCRIPT_PATH}")
+
+source $SCRIPT_ROOT/env.sh
+
 export CAPZ_DIR="${CAPZ_DIR:-"${GOPATH}/src/sigs.k8s.io/cluster-api-provider-azure"}"
 : "${CAPZ_DIR:?Environment variable empty or not defined.}"
 if [[ ! -d $CAPZ_DIR ]]; then
@@ -14,12 +17,15 @@ if [[ ! -d $CAPZ_DIR ]]; then
 fi
 
 main() {
+    az login --service-principal --username $AZURE_CLIENT_ID --tenant $AZURE_TENANT_ID --password $AZURE_CLIENT_SECRET
+    az account set --subscription $AZURE_SUBSCRIPTION_ID
+
     # defaults
     export KUBERNETES_VERSION="${KUBERNETES_VERSION:-"latest"}"
     export CONTROL_PLANE_MACHINE_COUNT="${AZURE_CONTROL_PLANE_MACHINE_COUNT:-"1"}"
     export WINDOWS_WORKER_MACHINE_COUNT="${WINDOWS_WORKER_MACHINE_COUNT:-"2"}"
-    export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2019"}"
-    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.6.17/containerd-1.6.17-windows-amd64.tar.gz"}"
+    export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2022"}"
+    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.7.6/containerd-1.7.6-windows-amd64.tar.gz"}"
     export GMSA="${GMSA:-""}" 
     export HYPERV="${HYPERV:-""}"
     export KPNG="${WINDOWS_KPNG:-""}"
@@ -28,7 +34,7 @@ main() {
     export ARTIFACTS="${ARTIFACTS:-${PWD}/_artifacts}"
     export CLUSTER_NAME="${CLUSTER_NAME:-capz-conf-$(head /dev/urandom | LC_ALL=C tr -dc a-z0-9 | head -c 6 ; echo '')}"
     export CAPI_EXTENSION_SOURCE="${CAPI_EXTENSION_SOURCE:-"https://github.com/Azure/azure-capi-cli-extension/releases/download/v0.1.5/capi-0.1.5-py2.py3-none-any.whl"}"
-    export IMAGE_SKU="${IMAGE_SKU:-"${WINDOWS_SERVER_VERSION:=windows-2019}-containerd-gen1"}"
+    export IMAGE_SKU="${IMAGE_SKU:-"${WINDOWS_SERVER_VERSION:=windows-2022}-containerd-gen1"}"
     
     # CI is an environment variable set by a prow job: https://github.com/kubernetes/test-infra/blob/master/prow/jobs.md#job-environment-variables
     export CI="${CI:-""}"
@@ -97,6 +103,7 @@ run_capz_e2e_cleanup() {
         # clean up GMSA NODE RG
         if [[ -n ${GMSA:-} ]]; then
             echo "Cleaning up gMSA resources $GMSA_NODE_RG with keyvault $GMSA_KEYVAULT_URL"
+
             az keyvault secret list --vault-name "${GMSA_KEYVAULT:-$CI_RG-gmsa}" --query "[? contains(name, '${GMSA_ID}')].name" -o tsv | while read -r secret ; do
                 az keyvault secret delete -n "$secret" --vault-name "${GMSA_KEYVAULT:-$CI_RG-gmsa}"
             done
@@ -129,6 +136,7 @@ create_cluster(){
         fi
         echo "Using $template"
         
+        #TODO: if exising RG and management cluster, can we just redeploy the workload cluster only
         az capi create -mg "${CLUSTER_NAME}" -y -w -n "${CLUSTER_NAME}" -l "$AZURE_LOCATION" --debug --template "$template" --tags creationTimestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         
         # copy generated template to logs
@@ -138,7 +146,9 @@ create_cluster(){
     fi
 
     # set the kube config to the workload cluster
-    export KUBECONFIG="$PWD"/"${CLUSTER_NAME}".kubeconfig
+    mv "$PWD"/"${CLUSTER_NAME}".kubeconfig "$SCRIPT_ROOT"/"${CLUSTER_NAME}".kubeconfig
+    export KUBECONFIG="$SCRIPT_ROOT"/"${CLUSTER_NAME}".kubeconfig
+    #export KUBECONFIG="$PWD"/"${CLUSTER_NAME}".kubeconfig
 }
 
 apply_workload_configuraiton(){
@@ -274,6 +284,9 @@ wait_for_nodes() {
         export KUBECONFIG="$PWD"/"${CLUSTER_NAME}".kubeconfig
     fi
 
+    # TODO: Assign the MI to the nodes, this will be updated in the templates
+    #nodenames = $(kubectl get nodes  --kubeconfig=./containerrolling-capz.kubeconfig -ojson | jq -r '.items[].metadata.name')
+    #az vm identity assign --resource-group <resource-group-name> --name <vm-name> --identities <user-assigned-identity-name>
 }
 
 set_azure_envs() {

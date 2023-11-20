@@ -17,7 +17,7 @@ spec:
         kubernetes.io/os: windows
       containers:
         - name: hpc
-          image: containerrollingregistry.azurecr.io/hpcagent:v15.0
+          image: containerrollingregistry.azurecr.io/hpcagent:v16.0
           securityContext:
             windowsOptions:
               hostProcess: true

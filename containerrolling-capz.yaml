@@ -26,7 +26,7 @@ spec:
         permissions: "0744"
       - content: |
           $ErrorActionPreference = 'Stop'
-          $CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v1.7.6/containerd-1.7.6-windows-amd64.tar.gz"
+          $CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v1.7.6/containerd-1.7.6-windocreate_clusterws-amd64.tar.gz"
           if($CONTAINERD_URL -ne ""){
             # Kubelet service depends on contianerd service so make a best effort attempt to stop it
             Stop-Service kubelet -Force -ErrorAction SilentlyContinue
@@ -46,7 +46,7 @@ spec:
 
           Stop-Service kubelet -Force
 
-          $CI_VERSION="v1.27.6-45+df5d09a3b82cc8"
+          $CI_VERSION="v1.27.8-3+f76ee87da1dbab"
           if($CI_VERSION -ne "")
           {
             $binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
@@ -61,7 +61,7 @@ spec:
           # Tag it to the ci version.  The image knows how to use the copy locally with the configmap
           # that is applied at at this stage (windows-kubeproxy-ci.yaml)
           ctr.exe -n k8s.io images pull docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess
-          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:v1.27.6-45_df5d09a3b82cc8-calico-hostprocess"
+          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:v1.27.8-3_f76ee87da1dbab-calico-hostprocess"
 
           kubeadm.exe version -o=short
           kubectl.exe version --client=true --short=true
@@ -138,7 +138,7 @@ spec:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
         kind: AzureMachineTemplate
         name: containerrolling-capz-md-win
-      version: v1.27.6-45+df5d09a3b82cc8
+      version: v1.27.8-3+f76ee87da1dbab
 ---
 apiVersion: controlplane.cluster.x-k8s.io/v1beta1
 kind: KubeadmControlPlane
@@ -177,7 +177,7 @@ spec:
           dataDir: /var/lib/etcddisk/etcd
           extraArgs:
             quota-backend-bytes: "8589934592"
-      kubernetesVersion: ci/v1.27.6-45+df5d09a3b82cc8
+      kubernetesVersion: ci/v1.27.8-3+f76ee87da1dbab
     diskSetup:
       filesystems:
       - device: /dev/disk/azure/scsi1/lun0
@@ -215,7 +215,7 @@ spec:
         # For the release packages it tests all versions in the support skew.
         LINE_SEPARATOR="*************************************************"
         echo "$LINE_SEPARATOR"
-        CI_VERSION=v1.27.6-45+df5d09a3b82cc8
+        CI_VERSION=v1.27.8-3+f76ee87da1dbab
         if [[ "${CI_VERSION}" != "" ]]; then
           CI_DIR=/tmp/k8s-ci
           mkdir -p $CI_DIR
@@ -225,7 +225,7 @@ spec:
           echo "* testing CI version $CI_VERSION"
           # Check for semver
           if [[ "${CI_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            VERSION_WITHOUT_PREFIX="1.27.6-45+df5d09a3b82cc8"
+            VERSION_WITHOUT_PREFIX="1.27.8-3+f76ee87da1dbab"
             DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl
             curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
             echo 'deb https://apt.kubernetes.io/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list
@@ -292,7 +292,7 @@ spec:
       kind: AzureMachineTemplate
       name: containerrolling-capz-control-plane
   replicas: 1
-  version: v1.27.6-45+df5d09a3b82cc8
+  version: v1.27.8-3+f76ee87da1dbab
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureCluster
@@ -302,7 +302,7 @@ metadata:
 spec:
   additionalTags:
     buildProvenance: canary
-    creationTimestamp: "2023-10-12T18:02:50Z"
+    creationTimestamp: "2023-11-17T21:43:08Z"
     jobName: cluster-api-provider-azure-e2e
   identityRef:
     apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -379,10 +379,10 @@ spec:
       image:
         computeGallery:
           gallery: windowsservercore
-          name: image-rs_sparc_ctr_v1
+          name: imagedef-rs_sparc_ctr_v1
           resourceGroup: containerRolling
           subscriptionID: 1c8c4edc-b188-4199-9580-3173033d75f7
-          version: 4.0.0
+          version: 25996.1000.231110
       osDisk:
         diskSizeGB: 128
         managedDisk:

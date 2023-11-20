@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loggingtest
+  labels:
+    app: loggingtest
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: loggingtest
+      labels:
+        app: loggingtest
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": windows
+      containers:
+      - name: loggingtest
+        image: containerrollingregistry.azurecr.io/serverdatacentercore:25975.1000.231012-1730
+        resources:
+          limits:
+            cpu: 1
+            memory: 800M
+  selector:
+    matchLabels:
+      app: loggingtest

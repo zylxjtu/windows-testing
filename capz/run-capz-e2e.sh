@@ -25,7 +25,7 @@ main() {
     export CONTROL_PLANE_MACHINE_COUNT="${AZURE_CONTROL_PLANE_MACHINE_COUNT:-"1"}"
     export WINDOWS_WORKER_MACHINE_COUNT="${WINDOWS_WORKER_MACHINE_COUNT:-"2"}"
     export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2022"}"
-    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.7.6/containerd-1.7.6-windows-amd64.tar.gz"}"
+    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.7.6/containerd-1.7.6-windocreate_clusterws-amd64.tar.gz"}"
     export GMSA="${GMSA:-""}" 
     export HYPERV="${HYPERV:-""}"
     export KPNG="${WINDOWS_KPNG:-""}"
@@ -41,6 +41,7 @@ main() {
 
     set_azure_envs
     set_ci_version
+
     IS_PRESUBMIT="$(capz::util::should_build_kubernetes)"
     if [[ "${IS_PRESUBMIT}" == "true" ]]; then
         "${CAPZ_DIR}/scripts/ci-build-kubernetes.sh";
@@ -48,11 +49,35 @@ main() {
     fi
     if [[ "${GMSA}" == "true" ]]; then create_gmsa_domain; fi
 
+    delete_old_cluster
     create_cluster
     apply_workload_configuraiton
     wait_for_nodes
     if [[ "${HYPERV}" == "true" ]]; then apply_hyperv_configuration; fi
     run_e2e_test
+}
+
+delete_old_cluster() {
+    # check if the image version has been processed
+    image_version=$(az sig image-version list --gallery-image-definition $GALLERY_IMAGE_NAME --gallery-name $GALLERY_NAME --resource-group $MI_RESOURCE_GROUP --query "sort_by([].{Name:name, Id:id, PublishedDate:publishingProfile.publishedDate}, &PublishedDate)" -o json | jq '.[0].Name')
+    
+    if [[ "$image_version" != "$GALLERY_IMAGE_VERSION" ]]; then
+        echo "Updating GALLERY_IMAGE_VERSION in env.sh"
+        sed -i "s/GALLERY_IMAGE_VERSION=.*/GALLERY_IMAGE_VERSION=$image_version/" $SCRIPT_ROOT/env.sh
+        source $SCRIPT_ROOT/env.sh
+
+        # clean up the current cluster
+        # currently KUBECONFIG is set to the workload cluster so reset to the management cluster
+        unset KUBECONFIG
+       
+        log "deleting old cluster"
+        az group delete --name "$RESOURCE_GROUP" --no-wait -y --force-deletion-types=Microsoft.Compute/virtualMachines --force-deletion-types=Microsoft.Compute/virtualMachineScaleSets || true
+
+    else
+        log "The host image version has been processed, skipping create cluster"
+        export SKIP_CREATE=true
+    fi
+        
 }
 
 create_gmsa_domain(){

@@ -14,7 +14,10 @@ export AZURE_SSH_PUBLIC_KEY_FILE="$HOME/.ssh/id_rsa.pub"
 export CAPZ_DIR="$HOME/cluster-api-provider-azure"
 export RESOURCE_GROUP="containerrolling-capz"
 export CLUSTER_NAME="containerrolling-capz"
-export SKIP_TEST=true
+#export SKIP_TEST=true
+
+# Normaly, we will not clean up the cluster when scripts exists.
+# The old cluster will be deleted when a new host image is available.
 export SKIP_CLEANUP=true
 #export SKIP_LOG_COLLECTION=true
 
@@ -22,6 +25,6 @@ export MI_RESOURCE_GROUP="containerRolling"
 export MANAGEDIDENTITY_ID="containerRollingMI"
 export MANAGEDIDENTITY_RESOURCE_ID="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourcegroups/$MI_RESOURCE_GROUP/providers/Microsoft.ManagedIdentity/userAssignedIdentities/$MANAGEDIDENTITY_ID"
 export GALLERY_NAME="windowsservercore"
-export GALLERY_IMAGE_NAME="image-rs_sparc_ctr_v1"
-export GALLERY_IMAGE_VERSION="4.0.0"
+export GALLERY_IMAGE_NAME="imagedef-rs_sparc_ctr_v1"
+export GALLERY_IMAGE_VERSION="25996.1000.231110"
 

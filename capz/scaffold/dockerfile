@@ -1,0 +1,37 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND="noninteractive"
+
+RUN apt update && \
+    apt dist-upgrade -y && \
+    apt install -y \
+	apt-utils \
+        curl \
+        git \
+        make \
+        jq \
+	gettext
+
+# to make source works inside the bash scripts
+RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+
+COPY install_capz.sh /install_capz.sh
+COPY capz.properties /capz.properties
+COPY env.sh /env.sh
+COPY id_rsa.pub /id_rsa.pub
+
+# A seperate mv step, as the $HOME is not avaliable in the COPY command
+RUN mv /install_capz.sh $HOME/install_capz.sh
+RUN mv /capz.properties $HOME/capz.properties
+RUN mv /env.sh $HOME/env.sh
+
+RUN chmod +x $HOME/install_capz.sh
+
+RUN mkdir -p $HOME/windows-testing
+RUN mkdir -p $HOME/cluster-api-provider-azure
+RUN mkdir -p $HOME/.ssh
+RUN mv /id_rsa.pub $HOME/.ssh/id_rsa.pub
+
+RUN $HOME/install_capz.sh
+
+RUN mv $HOME/env.sh $HOME/windows-testing/capz/env.sh > /dev/null 2>&1

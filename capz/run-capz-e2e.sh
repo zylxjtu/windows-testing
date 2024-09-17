@@ -7,10 +7,13 @@ set -o functrace
 
 SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]}")
 SCRIPT_ROOT=$(dirname "${SCRIPT_PATH}")
+
+source $SCRIPT_ROOT/env.sh
+
 export CAPZ_DIR="${CAPZ_DIR:-"${GOPATH}/src/sigs.k8s.io/cluster-api-provider-azure"}"
 : "${CAPZ_DIR:?Environment variable empty or not defined.}"
 if [[ ! -d $CAPZ_DIR ]]; then
-    echo "Must have capz repo present"
+    log "Must have capz repo present"
 fi
 export AZURE_CLOUD_PROVIDER_ROOT="${AZURE_CLOUD_PROVIDER_ROOT:-"${GOPATH}/src/sigs.k8s.io/cloud-provider-azure"}"
 : "${AZURE_CLOUD_PROVIDER_ROOT:?Environment variable empty or not defined.}"
@@ -19,11 +22,14 @@ if [[ ! -d $AZURE_CLOUD_PROVIDER_ROOT ]]; then
 fi
 
 main() {
+    # az login --service-principal --username $AZURE_CLIENT_ID --tenant $AZURE_TENANT_ID --password $AZURE_CLIENT_SECRET
+    # az account set --subscription $AZURE_SUBSCRIPTION_ID
+
     # defaults
     export KUBERNETES_VERSION="${KUBERNETES_VERSION:-"latest"}"
     export CONTROL_PLANE_MACHINE_COUNT="${AZURE_CONTROL_PLANE_MACHINE_COUNT:-"1"}"
     export WINDOWS_WORKER_MACHINE_COUNT="${WINDOWS_WORKER_MACHINE_COUNT:-"2"}"
-    export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2019"}"
+    export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2022"}"
     export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.7.16/containerd-1.7.16-windows-amd64.tar.gz"}"
     export GMSA="${GMSA:-""}" 
     export HYPERV="${HYPERV:-""}"
@@ -37,14 +43,18 @@ main() {
     # other config
     export ARTIFACTS="${ARTIFACTS:-${PWD}/_artifacts}"
     export CLUSTER_NAME="${CLUSTER_NAME:-capz-conf-$(head /dev/urandom | LC_ALL=C tr -dc a-z0-9 | head -c 6 ; echo '')}"
-    export IMAGE_SKU="${IMAGE_SKU:-"${WINDOWS_SERVER_VERSION:=windows-2019}-containerd-gen1"}"
+    # This might not required after a MI related fix
+    export CAPI_EXTENSION_SOURCE="${CAPI_EXTENSION_SOURCE:-"https://github.com/Azure/azure-capi-cli-extension/releases/download/v0.1.5/capi-0.1.5-py2.py3-none-any.whl"}"
+    export IMAGE_SKU="${IMAGE_SKU:-"${WINDOWS_SERVER_VERSION:=windows-2022}-containerd-gen1"}"
     
     # CI is an environment variable set by a prow job: https://github.com/kubernetes/test-infra/blob/master/prow/jobs.md#job-environment-variables
     export CI="${CI:-""}"
 
+    get_access
     set_azure_envs
 
     set_ci_version
+
     IS_PRESUBMIT="$(capz::util::should_build_kubernetes)"
     echo "IS_PRESUBMIT=$IS_PRESUBMIT"
     if [[ "${IS_PRESUBMIT}" == "true" ]]; then
@@ -54,11 +64,17 @@ main() {
     if [[ "${GMSA}" == "true" ]]; then create_gmsa_domain; fi
 
     install_tools
-    create_cluster
-    apply_workload_configuraiton
-    apply_cloud_provider_azure
-    wait_for_nodes
-    if [[ "${HYPERV}" == "true" ]]; then apply_hyperv_configuration; fi
+
+    check_old_cluster
+    if [[ ! "$SKIP_CREATE" == "true" ]]; then
+        create_cluster
+        apply_workload_configuraiton
+        wait_for_nodes
+        if [[ "${HYPERV}" == "true" ]]; then apply_hyperv_configuration; fi
+        
+        deploy_monagent_daemonset
+    fi
+    
     run_e2e_test
 }
 
@@ -78,6 +94,79 @@ install_tools(){
         curl --retry "$CURL_RETRIES" -L https://github.com/kubernetes-sigs/cluster-api/releases/download/"$CAPI_VERSION"/clusterctl-linux-amd64 -o "$TOOLS_BIN_DIR"/clusterctl
         chmod +x "$TOOLS_BIN_DIR"/clusterctl
     fi
+}
+
+get_access() {
+    # Get access using the managed identity
+    az login --identity --username $MANAGEDIDENTITY_RESOURCE_ID
+    # This is comment out as it is for testing purpose only
+    #az login --service-principal --username $AZURE_CLIENT_ID --tenant $AZURE_TENANT_ID --password $AZURE_CLIENT_SECRET
+    az account set --subscription $AZURE_SUBSCRIPTION_ID
+
+    # Get the secrets from the KV
+    export AZURE_CLIENT_SECRET=$(az keyvault secret show --vault-name "${KEYVAULT_NAME}" --name "${AZURE_CLIENT_SECRET_NAME}" --query value -o tsv)
+    
+    export CAPZ_STORAGE_URL=$(az keyvault secret show --vault-name "${KEYVAULT_NAME}" --name "${CAPZ_STORAGE_URL_NAME}" --query value -o tsv)
+
+    AZURE_SSH_PUBLIC_KEY=$(az keyvault secret show --vault-name "${KEYVAULT_NAME}" --name "${AZURE_SSH_PUBLIC_KEY_NAME}" --query value -o tsv)
+    echo "$AZURE_SSH_PUBLIC_KEY" > $AZURE_SSH_PUBLIC_KEY_FILE
+
+    AZURE_SSH_PRIVATE_KEY=$(az keyvault secret show --vault-name "${KEYVAULT_NAME}" --name "${AZURE_SSH_PRIVATE_KEY_NAME}" --query value -o tsv)
+    echo "$AZURE_SSH_PUBLIC_KEY" > $AZURE_SSH_PRIVATE_KEY_FILE
+
+}   
+
+
+check_old_cluster() {
+    # check if the image version has been processed
+    # Checke the lastest image version in the gallery
+    image_version=$(az sig image-version list --gallery-image-definition $GALLERY_IMAGE_NAME --gallery-name $GALLERY_NAME --resource-group $RESOURCE_GROUP --query "sort_by([].{Name:name, Id:id, PublishedDate:publishingProfile.publishedDate}, &PublishedDate)" | jq -r '.[-1].Name')
+    
+    rm -rf ${SCRIPT_ROOT}/capzcluster/*
+
+    # Check the image verison being processed and saved in to the storage account
+    azcopy copy "${CAPZ_STORAGE_URL}" "${SCRIPT_ROOT}" --recursive
+
+    # Check the version file under the directory and retrieve the version line
+    version_file="${SCRIPT_ROOT}/capzcluster/version.json"
+    cluster_version=""
+    if [[ -f "$version_file" ]]; then
+         cluster_version=$(cat "$version_file" | jq -r '.version')
+    fi
+
+    # Check if the image version has been processed and the kubeconfig file exists
+    if [[ "$image_version" != "$cluster_version" || ! -f "${SCRIPT_ROOT}/capzcluster/${CLUSTER_NAME}.kubeconfig" || ! -f "${SCRIPT_ROOT}/capzcluster/config" ]]; then
+    
+        # clean up the current cluster
+        # currently KUBECONFIG is set to the workload cluster so reset to the management cluster
+        unset KUBECONFIG
+       
+        rg_exists=$(az group exists --name "$CAPZ_RESOURCE_GROUP")
+        if [[ $rg_exists = "true" ]] ; then
+            log "deleting old cluster"
+            az group delete --name "$CAPZ_RESOURCE_GROUP" -y --force-deletion-types=Microsoft.Compute/virtualMachines --force-deletion-types=Microsoft.Compute/virtualMachineScaleSets || true
+            log "old cluster deleted"
+
+	    # As cluster being deleted, remove the kubeconfig file as well
+            azcopy rm "${CAPZ_STORAGE_URL}" --recursive=true
+	    log "kubeconfig removed"
+        fi  
+        export SKIP_CREATE=false
+
+        export GALLERY_IMAGE_VERSION=$image_version
+        log "The host image version will be processed: $image_version"
+    else
+        log "The host image version has been processed, skipping create cluster"
+        export SKIP_CREATE=true
+
+        log "Restore the existing kubeconfig"
+        export KUBECONFIG="$SCRIPT_ROOT"/capzcluster/"${CLUSTER_NAME}".kubeconfig
+
+        #TODO: do we need the kubeconfig for management cluster
+        mkdir -p $HOME/.kube
+        cp -f "${SCRIPT_ROOT}/capzcluster/config" $HOME/.kube/config
+    fi
+        
 }
 
 create_gmsa_domain(){
@@ -350,6 +439,13 @@ apply_hyperv_configuration(){
     set +x
 }
 
+deploy_monagent_daemonset(){
+    log "wait for monagent pods to start"
+    kubectl apply -f "${SCRIPT_ROOT}/hpc.yaml"
+    #timeout 5m kubectl wait --for=condition=ready pod --all  --timeout -1s
+    kubectl rollout status daemonsets/hpc --timeout=5m
+}
+
 run_e2e_test() {
     export SKIP_TEST="${SKIP_TEST:-"false"}"
     if [[ ! "$SKIP_TEST" == "true" ]]; then
@@ -458,6 +554,22 @@ wait_for_nodes() {
         export KUBECONFIG="$SCRIPT_ROOT"/"${CLUSTER_NAME}".kubeconfig
     fi
 
+    # As all the nodes have been up and running, upload the image version and the configs to the storage account
+    # This check should not be needed but just in case
+    if [[ ! "$SKIP_CREATE" == "true" ]]; then
+        mkdir -p ${SCRIPT_ROOT}/capzcluster
+        rm -rf ${SCRIPT_ROOT}/capzluster/*
+        
+        echo "{\"version\": \"$image_version\"}" > ${SCRIPT_ROOT}/capzcluster/version.json
+        cp -f "${SCRIPT_ROOT}"/"${CLUSTER_NAME}".kubeconfig ${SCRIPT_ROOT}/capzcluster/
+        cp -f "${HOME}"/.kube/config ${SCRIPT_ROOT}/capzcluster/
+        
+        azcopy copy "${SCRIPT_ROOT}/capzcluster/*" "${CAPZ_STORAGE_URL}" --recursive
+    fi
+
+    # TODO: Assign the MI to the nodes, this will be updated in the templates
+    #nodenames = $(kubectl get nodes  --kubeconfig=./containerrolling-capz.kubeconfig -ojson | jq -r '.items[].metadata.name')
+    #az vm identity assign --resource-group <resource-group-name> --name <vm-name> --identities <user-assigned-identity-name>
 }
 
 set_azure_envs() {

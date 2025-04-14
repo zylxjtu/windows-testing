@@ -60,15 +60,20 @@ spec:
           containerd-shim-runhcs-v1.exe --version
         path: C:/replace-containerd.ps1
         permissions: "0744"
-      - content: |
-          $ErrorActionPreference = "Stop"
-          # Check if NodeLogQuery feature gate was specified for the cluster and if so, also enable it via kubelet config
-          $kubeletEnvContents = Get-Content -Path "/var/lib/kubelet/kubeadm-flags.env"
-          if ($kubeletEnvContents.Contains("NodeLogQuery=true")) {
-              Add-Content -Path "$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml" -Value "enableSystemLogQuery: true" -Encoding ascii -NoNewLine
-              nssm restart kubelet
-          }
-        path: C:/NodeLogQueryKubeletConfig.ps1
+      - content: "$ErrorActionPreference = \"Stop\"\n$FileContent = Get-Content -Path
+          \"$env:SYSTEMDRIVE/var/lib/kubelet/kubeadm-flags.env\"\n$kubeAdmArgs = $FileContent.TrimStart('KUBELET_KUBEADM_ARGS=').Trim('\"')\n\n#
+          Set the path to your kubelet config file\n$configFile = \"$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml\"\n$content
+          = Get-Content -Path $configFile\n# Check if NodeLogQuery feature gate was
+          specified for the cluster and if so, also enable it via kubelet config\nif
+          ($kubeAdmArgs.Contains(\"NodeLogQuery=true\")) {\n    $content += \"enableSystemLogQuery:
+          true\"\n}\nif ($kubeAdmArgs.Contains(\"WindowsGracefulNodeShutdown=true\"))
+          {\n  # Remove existing lines that match the settings\n  $content = $content
+          | Where-Object { $_ -notmatch \"^shutdownGracePeriod:\" -and $_ -notmatch
+          \"^shutdownGracePeriodCriticalPods:\" }\n  # Append new values at the end\n
+          \ $content += \"shutdownGracePeriod: 1m\"\n  $content += \"shutdownGracePeriodCriticalPods:
+          20s\"         \n}\n\n# Write the updated content back to the file\n$content
+          | Set-Content -Path $configFile -Encoding ascii   \n"
+        path: C:/updateKubeletConfig.ps1
         permissions: "0744"
       - content: |
           mkdir -Force c:/localdumps
@@ -128,8 +133,8 @@ spec:
             windows-priorityclass: ABOVE_NORMAL_PRIORITY_CLASS
           name: '{{ ds.meta_data["local_hostname"] }}'
       postKubeadmCommands:
-      - powershell C:/NodeLogQueryKubeletConfig.ps1
-      - nssm set kubelet start SERVICE_AUTO_START
+      - powershell C:/updateKubeletConfig.ps1
+      - powershell C:/k/RestartKubelet.ps1
       - powershell C:/defender-exclude-calico.ps1
       preKubeadmCommands:
       - powershell C:/create-temp-folder.ps1
@@ -425,9 +430,11 @@ spec:
       identity: UserAssigned
       image:
         computeGallery:
-          gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
-          name: ${GALLERY_IMAGE_NAME:=capi-win-2022-containerd}
-          version: ${IMAGE_VERSION:=latest}
+          gallery: ClusterAPI1744673167ezal
+          name: capi-windows-2022-containerd
+          resourceGroup: cluster-api-gallery
+          subscriptionID: 1c8c4edc-b188-4199-9580-3173033d75f7
+          version: 0.3.1744673183
       osDisk:
         diskSizeGB: 128
         managedDisk:

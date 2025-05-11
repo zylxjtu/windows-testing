@@ -84,6 +84,48 @@ spec:
         path: C:/collect-hns-crashes.ps1
         permissions: "0744"
       - content: |
+          Write-Host "Starting to set environment variables for monagent ..."
+          $roleInstanceValue = (Get-ChildItem -Path Env:\COMPUTERNAME).Value
+          Write-Verbose "roleInstance : $roleInstanceValue" -Verbose
+          $env:MONITORING_TENANT = "wcct_capz"
+          $env:MONITORING_ROLE = "monagentcluster"
+          $env:MONITORING_ROLE_INSTANCE = $roleInstanceValue
+          $env:MONITORING_DATA_DIRECTORY = "C:\localdir"
+
+          $env:MONITORING_GCS_ACCOUNT="DPLATWINDOWSSERVERCONTAINERSTEST"
+          $env:MONITORING_GCS_NAMESPACE="wccttest"
+          $env:MONITORING_GCS_ENVIRONMENT="Test"
+          $env:MONITORING_GCS_REGION="East US"
+          # The version will need to be updated along with the MDS config update
+          $env:MONITORING_CONFIG_VERSION="1.1"
+          $env:MONITORING_GCS_AUTH_ID_TYPE="AuthMSIToken"
+          #$env:MONITORING_MANAGED_ID_IDENTIFIER="client_id"
+          #$env:MONITORING_MANAGED_ID_VALUE="5af6054a-0d2d-451f-9eb5-6e428cd49964"
+          $env:MONITORING_MANAGED_ID_IDENTIFIER="mi_res_id"
+          $env:MONITORING_MANAGED_ID_VALUE="/subscriptions/1c8c4edc-b188-4199-9580-3173033d75f7/resourcegroups/wcct-agentbaker-test/providers/Microsoft.ManagedIdentity/userAssignedIdentities/wcct-agentbaker-identity"
+          Write-Verbose "Finished setting environment variable." -Verbose
+
+          $currentPath = Get-Location
+
+          Write-Host "Starting to check if monagent has been installed as VMSS extension ..."
+          $monAgentClientLocation = (Get-ChildItem -Path Env:\MonAgentClientLocation -ErrorAction SilentlyContinue).Value
+          if ($null -ne $monAgentClientLocation ) {
+              Write-Host "monAgentClientLocation: $MONITORING_TENANT"
+              Write-Host "MonAgent extension has been installed, need to run monagent client to drop the config"
+
+              $monAgentClientFullPath = Join-Path -Path $monAgentClientLocation -ChildPAth "MonAgentClient.exe"
+            Invoke-Expression "$monAgentClientFullPath -useenv"
+              # keep alive
+            while ($true) {
+              Start-Sleep -Seconds 86400  # Sleep for 24 hours in each iteration
+            }    
+          }
+          else {
+              Write-Host "MonAgent vmss extension not isntalled yet, will need to launch the monagent directly"
+          }
+        path: C:/start-monagent.ps1
+        permissions: "0744"
+      - content: |
           ${AZURE_SSH_PUBLIC_KEY:=""}
         owner: root:root
         path: C:/ProgramData/ssh/administrators_authorized_keys
@@ -107,6 +149,7 @@ spec:
       - powershell C:/create-temp-folder.ps1
       - powershell C:/replace-containerd.ps1
       - powershell C:/collect-hns-crashes.ps1
+      - powershell C:/start-monagent.ps1
       users:
       - groups: Administrators
         name: capi
@@ -118,7 +161,6 @@ kind: Cluster
 metadata:
   labels:
     cni: ${CLUSTER_NAME}-calico
-    containerd-logger: enabled
     csi-proxy: enabled
     metrics-server: enabled
   name: ${CLUSTER_NAME}
@@ -320,6 +362,9 @@ spec:
       userAssignedIdentities:
       - providerID:  ${USER_IDENTITY}
       vmSize: Standard_D2s_v3
+      additionalTags:
+        azsecpack: nonprod
+        AzSecPackAutoConfigReady: "true"
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureMachineTemplate

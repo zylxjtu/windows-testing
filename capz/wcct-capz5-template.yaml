@@ -1,7 +1,7 @@
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
 kind: KubeadmConfigTemplate
 metadata:
-  name: ${CLUSTER_NAME}-md-win
+  name: wcct-capz5-md-win
   namespace: default
 spec:
   template:
@@ -10,7 +10,7 @@ spec:
       - contentFrom:
           secret:
             key: worker-node-azure.json
-            name: ${CLUSTER_NAME}-md-win-azure-json
+            name: wcct-capz5-md-win-azure-json
         owner: root:root
         path: c:/k/azure.json
         permissions: "0644"
@@ -26,13 +26,13 @@ spec:
         permissions: "0744"
       - content: |
           $ErrorActionPreference = 'Stop'
-          $$CONTAINERD_URL="${WINDOWS_CONTAINERD_URL}"
-          if($$CONTAINERD_URL -ne ""){
+          $CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v2.0.2/containerd-2.0.2-windows-amd64.tar.gz"
+          if($CONTAINERD_URL -ne ""){
             # Kubelet service depends on contianerd service so make a best effort attempt to stop it
             Stop-Service kubelet -Force -ErrorAction SilentlyContinue
             Stop-Service containerd -Force
-            echo "downloading containerd: $$CONTAINERD_URL"
-            curl.exe --retry 10 --retry-delay 5 -L "$$CONTAINERD_URL" --output "c:/k/containerd.tar.gz"
+            echo "downloading containerd: $CONTAINERD_URL"
+            curl.exe --retry 10 --retry-delay 5 -L "$CONTAINERD_URL" --output "c:/k/containerd.tar.gz"
             # Log service state and if any files under containerd director are locked
             Get-Service -Name containerd, kubelet
             $dir = "c:/Program Files/containerd"
@@ -103,7 +103,7 @@ spec:
         path: C:/start-monagent.ps1
         permissions: "0744"
       - content: |
-          ${AZURE_SSH_PUBLIC_KEY:=""}
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDH4bW5rTED44cyHDKNLYh3uV/oMMQb0k0PFwh6rN2W1eTd70Ieods1f1+OAHtcF8sDv3bdN7mKlhGh+Xfo79nfGGtECA9k0byxIjs79qmvzoV/DoE6I5+zzo0cRnjlOR1USFifeHswfBHhssicnTag3iJLJVUXgzoQ7KY7C7QoK5GP/H2zymwpelLd9GB/pGUorO8KNMNTFQlt/AqI0iImPwvbIDyeKYHeIDSP8ZhLZTbYJ0kuFkMzsIUPpFgzFgzyqjioIEmajOIOOY7uRI6kmmD1Brib4Z+XjnweEbFo7IgmnAks1bDq9hogq/5ilX/sEOhoZ7uLJztbg/NgnA7v azureuser@yuanlianglinux
         owner: root:root
         path: C:/ProgramData/ssh/administrators_authorized_keys
         permissions: "0640"
@@ -112,35 +112,40 @@ spec:
 
           Stop-Service kubelet -Force
 
-          $$KUBE_GIT_VERSION="${KUBE_GIT_VERSION}"
-          if($$KUBE_GIT_VERSION -ne "")
+          $CI_VERSION="v1.32.4-4+a624d76abdf199"
+          if($CI_VERSION -ne "")
           {
-            $$binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
-            $$ci_url="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${KUBE_GIT_VERSION}/bin/windows/amd64"
-            foreach ( $$binary in $$binaries )
+            $binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
+            $ci_url="https://storage.googleapis.com/k8s-release-dev/ci/$CI_VERSION/bin/windows/amd64"
+            foreach ( $binary in $binaries )
             {
-              echo "downloading binary: $$ci_url/$$binary.exe"
-              curl.exe --retry 10 --retry-delay 5 "$$ci_url/$$binary.exe" --output "c:/k/$$binary.exe"
+              echo "downloading binary: $ci_url/$binary.exe"
+              curl.exe --retry 10 --retry-delay 5 "$ci_url/$binary.exe" --output "c:/k/$binary.exe"
             }
           }
 
           # Tag it to the ci version.  The image knows how to use the copy locally with the configmap
           # that is applied at at this stage (windows-kubeproxy-ci.yaml)
-          ctr.exe -n k8s.io images pull docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess
-          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:${CI_VERSION/+/_}-calico-hostprocess"
+          # use containerd local service vs transfer service until transfer service stabalizes in containerd 2.0
+          ctr.exe -n k8s.io images pull --local docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess
+          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:v1.32.4-4_a624d76abdf199-calico-hostprocess"
 
+          echo "kubeadm version: "
           kubeadm.exe version -o=short
-          kubectl.exe version --client=true --short=true
+          echo "kubectl version: "
+          kubectl.exe version --client=true
+          echo "kubelet version: "
           kubelet.exe --version
+          echo "kube-proxy version: "
           kube-proxy.exe --version
-        path: C:/replace-pr-binaries.ps1
+        path: C:/replace-ci-binaries.ps1
         permissions: "0744"
       joinConfiguration:
         nodeRegistration:
           criSocket: npipe:////./pipe/containerd-containerd
           kubeletExtraArgs:
             cloud-provider: external
-            feature-gates: ${NODE_FEATURE_GATES:-""}
+            feature-gates: WindowsGracefulNodeShutdown=true
             image-credential-provider-bin-dir: /var/lib/kubelet/credential-provider
             image-credential-provider-config: /var/lib/kubelet/credential-provider-config.yaml
             v: "2"
@@ -155,21 +160,22 @@ spec:
       - powershell C:/replace-containerd.ps1
       - powershell C:/collect-hns-crashes.ps1
       - powershell C:/start-monagent.ps1
-      - powershell C:/replace-pr-binaries.ps1
+      - powershell C:/replace-ci-binaries.ps1
       users:
       - groups: Administrators
         name: capi
         sshAuthorizedKeys:
-        - ${AZURE_SSH_PUBLIC_KEY:=""}
+        - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDH4bW5rTED44cyHDKNLYh3uV/oMMQb0k0PFwh6rN2W1eTd70Ieods1f1+OAHtcF8sDv3bdN7mKlhGh+Xfo79nfGGtECA9k0byxIjs79qmvzoV/DoE6I5+zzo0cRnjlOR1USFifeHswfBHhssicnTag3iJLJVUXgzoQ7KY7C7QoK5GP/H2zymwpelLd9GB/pGUorO8KNMNTFQlt/AqI0iImPwvbIDyeKYHeIDSP8ZhLZTbYJ0kuFkMzsIUPpFgzFgzyqjioIEmajOIOOY7uRI6kmmD1Brib4Z+XjnweEbFo7IgmnAks1bDq9hogq/5ilX/sEOhoZ7uLJztbg/NgnA7v
+          azureuser@yuanlianglinux
 ---
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: Cluster
 metadata:
   labels:
-    cni: ${CLUSTER_NAME}-calico
+    cni: wcct-capz5-calico
     csi-proxy: enabled
     metrics-server: enabled
-  name: ${CLUSTER_NAME}
+  name: wcct-capz5
   namespace: default
 spec:
   clusterNetwork:
@@ -179,20 +185,20 @@ spec:
   controlPlaneRef:
     apiVersion: controlplane.cluster.x-k8s.io/v1beta1
     kind: KubeadmControlPlane
-    name: ${CLUSTER_NAME}-control-plane
+    name: wcct-capz5-control-plane
   infrastructureRef:
     apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
     kind: AzureCluster
-    name: ${CLUSTER_NAME}
+    name: wcct-capz5
 ---
 apiVersion: cluster.x-k8s.io/v1beta1
 kind: MachineDeployment
 metadata:
-  name: ${CLUSTER_NAME}-md-win
+  name: wcct-capz5-md-win
   namespace: default
 spec:
-  clusterName: ${CLUSTER_NAME}
-  replicas: ${WINDOWS_WORKER_MACHINE_COUNT:-2}
+  clusterName: wcct-capz5
+  replicas: 2
   selector: {}
   template:
     spec:
@@ -200,43 +206,41 @@ spec:
         configRef:
           apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
           kind: KubeadmConfigTemplate
-          name: ${CLUSTER_NAME}-md-win
-      clusterName: ${CLUSTER_NAME}
+          name: wcct-capz5-md-win
+      clusterName: wcct-capz5
       infrastructureRef:
         apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
         kind: AzureMachineTemplate
-        name: ${CLUSTER_NAME}-md-win
-      version: ${KUBERNETES_VERSION}
+        name: wcct-capz5-md-win
+      version: v1.32.4-4+a624d76abdf199
 ---
 apiVersion: controlplane.cluster.x-k8s.io/v1beta1
 kind: KubeadmControlPlane
 metadata:
-  annotations:
-    controlplane.cluster.x-k8s.io/skip-kube-proxy: "true"
-  name: ${CLUSTER_NAME}-control-plane
+  name: wcct-capz5-control-plane
   namespace: default
 spec:
   kubeadmConfigSpec:
     clusterConfiguration:
       apiServer:
         extraArgs:
-          feature-gates: ${API_SERVER_FEATURE_GATES:-""}
+          feature-gates: ""
         timeoutForControlPlane: 20m
       controllerManager:
         extraArgs:
           allocate-node-cidrs: "false"
           cloud-provider: external
-          cluster-name: ${CLUSTER_NAME}
+          cluster-name: wcct-capz5
           v: "4"
       etcd:
         local:
           dataDir: /var/lib/etcddisk/etcd
           extraArgs:
             quota-backend-bytes: "8589934592"
-      kubernetesVersion: ci/${CI_VERSION}
+      kubernetesVersion: ci/v1.32.4-4+a624d76abdf199
       scheduler:
         extraArgs:
-          feature-gates: ${SCHEDULER_FEATURE_GATES:-""}
+          feature-gates: ""
     diskSetup:
       filesystems:
       - device: /dev/disk/azure/scsi1/lun0
@@ -258,7 +262,7 @@ spec:
     - contentFrom:
         secret:
           key: control-plane-azure.json
-          name: ${CLUSTER_NAME}-control-plane-azure-json
+          name: wcct-capz5-control-plane-azure-json
       owner: root:root
       path: /etc/kubernetes/azure.json
       permissions: "0644"
@@ -270,108 +274,117 @@ spec:
         if grep -q "NodeLogQuery=true" /var/lib/kubelet/kubeadm-flags.env; then
           [[ $(id -u) != 0 ]] && SUDO="sudo" || SUDO=""
           echo "* adding enableSystemLogQuery: true to kubelet config"
-          printf "enableSystemLogQuery: true\n" | $${SUDO} tee --append /var/lib/kubelet/config.yaml
-          $${SUDO} systemctl restart kubelet
+          printf "enableSystemLogQuery: true\n" | ${SUDO} tee --append /var/lib/kubelet/config.yaml
+          ${SUDO} systemctl restart kubelet
         fi
       owner: root:root
       path: /tmp/node-log-query-kubelet-config.sh
       permissions: "0744"
     - content: |
         #!/bin/bash
-
         set -o nounset
         set -o pipefail
         set -o errexit
-
-        systemctl stop kubelet
-        declare -a BINARIES=("kubeadm" "kubectl" "kubelet")
-        for BINARY in "$${BINARIES[@]}"; do
-          echo "* installing package: $${BINARY} ${KUBE_GIT_VERSION}"
-          curl --retry 10 --retry-delay 5 "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${KUBE_GIT_VERSION}/bin/linux/amd64/$${BINARY}" --output "/usr/bin/$${BINARY}"
-        done
-        systemctl restart kubelet
-
-        # prepull images from gcr.io/k8s-staging-ci-images and retag it to
-        # registry.k8s.io so kubeadm can fetch correct images no matter what
-        declare -a IMAGES=("kube-apiserver" "kube-controller-manager" "kube-proxy" "kube-scheduler")
         [[ $(id -u) != 0 ]] && SUDO="sudo" || SUDO=""
-        IMAGE_REGISTRY_PREFIX=registry.k8s.io
-        for IMAGE in "$${IMAGES[@]}"; do
-          $${SUDO} ctr -n k8s.io images tag $$IMAGE_REGISTRY_PREFIX/$$IMAGE-amd64:"${CI_VERSION//+/_}" $$IMAGE_REGISTRY_PREFIX/$$IMAGE:"${CI_VERSION//+/_}"
-          $${SUDO} ctr -n k8s.io images tag $$IMAGE_REGISTRY_PREFIX/$$IMAGE-amd64:"${CI_VERSION//+/_}" gcr.io/k8s-staging-ci-images/$$IMAGE:"${CI_VERSION//+/_}"
-        done
-
-        echo "kubeadm version: $(kubeadm version -o=short)"
-        echo "kubectl version: $(kubectl version --client=true --short=true)"
-        echo "kubelet version: $(kubelet --version)"
+        # This test installs release packages or binaries that are a result of the CI and release builds.
+        # It runs '... --version' commands to verify that the binaries are correctly installed
+        # and finally uninstalls the packages.
+        # For the release packages it tests all versions in the support skew.
+        LINE_SEPARATOR="*************************************************"
+        echo "$LINE_SEPARATOR"
+        CI_VERSION=v1.32.4-4+a624d76abdf199
+        if [[ "${CI_VERSION}" != "" ]]; then
+          CI_DIR=/tmp/k8s-ci
+          mkdir -p $CI_DIR
+          declare -a PACKAGES_TO_TEST=("kubectl" "kubelet" "kubeadm")
+          declare -a CONTAINERS_TO_TEST=("kube-apiserver" "kube-controller-manager" "kube-proxy" "kube-scheduler")
+          CONTAINER_EXT="tar"
+          echo "* testing CI version $CI_VERSION"
+          # Check for semver
+          if [[ "${CI_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            VERSION_WITHOUT_PREFIX="1.32.4-4+a624d76abdf199"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https curl
+            curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+            echo 'deb https://apt.kubernetes.io/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list
+            apt-get update
+            # replace . with \.
+            VERSION_REGEX=""
+            PACKAGE_VERSION="$(apt-cache madison kubelet|grep ${VERSION_REGEX}- | head -n1 | cut -d '|' -f 2 | tr -d '[:space:]')"
+            for CI_PACKAGE in "${PACKAGES_TO_TEST[@]}"; do
+              echo "* installing package: $CI_PACKAGE ${PACKAGE_VERSION}"
+              DEBIAN_FRONTEND=noninteractive apt-get install -y $CI_PACKAGE=$PACKAGE_VERSION
+            done
+          else
+            CI_URL="https://storage.googleapis.com/k8s-release-dev/ci/${CI_VERSION}/bin/linux/amd64"
+            for CI_PACKAGE in "${PACKAGES_TO_TEST[@]}"; do
+              echo "* downloading binary: $CI_URL/$CI_PACKAGE"
+              wget "$CI_URL/$CI_PACKAGE" -nv -O "$CI_DIR/$CI_PACKAGE"
+              chmod +x "$CI_DIR/$CI_PACKAGE"
+              mv "$CI_DIR/$CI_PACKAGE" "/usr/bin/$CI_PACKAGE"
+            done
+            IMAGE_REGISTRY_PREFIX=registry.k8s.io
+            for CI_CONTAINER in "${CONTAINERS_TO_TEST[@]}"; do
+              echo "* downloading package: $CI_URL/$CI_CONTAINER.$CONTAINER_EXT"
+              wget "$CI_URL/$CI_CONTAINER.$CONTAINER_EXT" -nv -O "$CI_DIR/$CI_CONTAINER.$CONTAINER_EXT"
+              ${SUDO} ctr -n k8s.io images import "$CI_DIR/$CI_CONTAINER.$CONTAINER_EXT" || echo "* ignoring expected 'ctr images import' result"
+              ${SUDO} ctr -n k8s.io images tag $IMAGE_REGISTRY_PREFIX/$CI_CONTAINER-amd64:"${CI_VERSION//+/_}" $IMAGE_REGISTRY_PREFIX/$CI_CONTAINER:"${CI_VERSION//+/_}"
+              ${SUDO} ctr -n k8s.io images tag $IMAGE_REGISTRY_PREFIX/$CI_CONTAINER-amd64:"${CI_VERSION//+/_}" gcr.io/k8s-staging-ci-images/$CI_CONTAINER:"${CI_VERSION//+/_}"
+            done
+          fi
+          systemctl restart kubelet
+        fi
+        echo "* checking binary versions"
+        echo "ctr version: " $(ctr version)
+        echo "kubeadm version: " $(kubeadm version -o=short)
+        echo "kubectl version: " $(kubectl version --client=true)
+        echo "kubelet version: " $(kubelet --version)
+        echo "$LINE_SEPARATOR"
       owner: root:root
-      path: /tmp/replace-k8s-binaries.sh
-      permissions: "0744"
-    - content: |
-        #!/bin/bash
-
-        set -o nounset
-        set -o pipefail
-        set -o errexit
-
-        curl -L --retry 10 --retry-delay 5 https://github.com/mikefarah/yq/releases/download/v4.6.1/yq_linux_amd64.tar.gz --output /tmp/yq_linux_amd64.tar.gz
-        tar -xzvf /tmp/yq_linux_amd64.tar.gz -C /tmp && mv /tmp/yq_linux_amd64 /usr/bin/yq
-        rm /tmp/yq_linux_amd64.tar.gz
-
-        export KUBECONFIG=/etc/kubernetes/admin.conf
-        kubectl -n kube-system set image daemonset/kube-proxy kube-proxy="${REGISTRY}/kube-proxy:${KUBE_IMAGE_TAG}"
-        systemctl stop kubelet
-        yq e '.spec.containers[0].image = "${REGISTRY}/kube-apiserver:${KUBE_IMAGE_TAG}"' -i /etc/kubernetes/manifests/kube-apiserver.yaml
-        yq e '.spec.containers[0].image = "${REGISTRY}/kube-controller-manager:${KUBE_IMAGE_TAG}"' -i /etc/kubernetes/manifests/kube-controller-manager.yaml
-        yq e '.spec.containers[0].image = "${REGISTRY}/kube-scheduler:${KUBE_IMAGE_TAG}"' -i /etc/kubernetes/manifests/kube-scheduler.yaml
-        systemctl restart kubelet
-      owner: root:root
-      path: /tmp/replace-k8s-components.sh
+      path: /tmp/kubeadm-bootstrap.sh
       permissions: "0744"
     initConfiguration:
       nodeRegistration:
         kubeletExtraArgs:
           cloud-provider: external
-          feature-gates: ${NODE_FEATURE_GATES:-""}
+          feature-gates: WindowsGracefulNodeShutdown=true
         name: '{{ ds.meta_data["local_hostname"] }}'
     joinConfiguration:
       nodeRegistration:
         kubeletExtraArgs:
           cloud-provider: external
-          feature-gates: ${NODE_FEATURE_GATES:-""}
+          feature-gates: WindowsGracefulNodeShutdown=true
         name: '{{ ds.meta_data["local_hostname"] }}'
     mounts:
     - - LABEL=etcd_disk
       - /var/lib/etcddisk
     postKubeadmCommands:
     - bash -c /tmp/node-log-query-kubelet-config.sh
-    - bash -c /tmp/replace-k8s-components.sh
     preKubeadmCommands:
-    - bash -c /tmp/replace-k8s-binaries.sh
+    - bash -c /tmp/kubeadm-bootstrap.sh
     useExperimentalRetryJoin: true
   machineTemplate:
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
       kind: AzureMachineTemplate
-      name: ${CLUSTER_NAME}-control-plane
-  replicas: ${CONTROL_PLANE_MACHINE_COUNT:-1}
-  version: ${KUBERNETES_VERSION}
+      name: wcct-capz5-control-plane
+  replicas: 1
+  version: v1.32.4-4+a624d76abdf199
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureCluster
 metadata:
-  name: ${CLUSTER_NAME}
+  name: wcct-capz5
   namespace: default
 spec:
   additionalTags:
-    buildProvenance: ${BUILD_PROVENANCE}
-    creationTimestamp: ${TIMESTAMP}
-    jobName: ${JOB_NAME}
+    buildProvenance: canary
+    creationTimestamp: "2025-05-12T01:41:01Z"
+    jobName: cluster-api-provider-azure-e2e
   identityRef:
     apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
     kind: AzureClusterIdentity
     name: cluster-identity
-  location: ${AZURE_LOCATION}
+  location: uksouth
   networkSpec:
     subnets:
     - name: control-plane-subnet
@@ -381,9 +394,9 @@ spec:
         name: node-natgateway
       role: node
     vnet:
-      name: ${AZURE_VNET_NAME:=${CLUSTER_NAME}-vnet}
-  resourceGroup: ${AZURE_RESOURCE_GROUP:=${CLUSTER_NAME}}
-  subscriptionID: ${AZURE_SUBSCRIPTION_ID}
+      name: wcct-capz5-vnet
+  resourceGroup: wcct-capz5
+  subscriptionID: 1c8c4edc-b188-4199-9580-3173033d75f7
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureClusterIdentity
@@ -394,15 +407,15 @@ metadata:
   namespace: default
 spec:
   allowedNamespaces: {}
-  clientID: ${MANAGEMENT_IDENTITY}
+  clientID: 7ed0d9d8-9fab-4c22-83f3-17b5a32cb375
   resourceID: test-this-doesnt-matter
-  tenantID: ${AZURE_TENANT_ID}
+  tenantID: 72f988bf-86f1-41af-91ab-2d7cd011db47
   type: UserAssignedMSI
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureMachineTemplate
 metadata:
-  name: ${CLUSTER_NAME}-control-plane
+  name: wcct-capz5-control-plane
   namespace: default
 spec:
   template:
@@ -419,13 +432,13 @@ spec:
         computeGallery:
           gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
           name: capi-ubun2-2404
-          version: ${IMAGE_VERSION:=latest}
+          version: latest
       osDisk:
         diskSizeGB: 128
         osType: Linux
-      sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      sshPublicKey: c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFESDRiVzVyVEVENDRjeUhES05MWWgzdVYvb01NUWIwazBQRndoNnJOMlcxZVRkNzBJZW9kczFmMStPQUh0Y0Y4c0R2M2JkTjdtS2xoR2grWGZvNzluZkdHdEVDQTlrMGJ5eElqczc5cW12em9WL0RvRTZJNSt6em8wY1JuamxPUjFVU0ZpZmVIc3dmQkhoc3NpY25UYWczaUpMSlZVWGd6b1E3S1k3QzdRb0s1R1AvSDJ6eW13cGVsTGQ5R0IvcEdVb3JPOEtOTU5URlFsdC9BcUkwaUltUHd2YklEeWVLWUhlSURTUDhaaExaVGJZSjBrdUZrTXpzSVVQcEZnekZnenlxamlvSUVtYWpPSU9PWTd1Ukk2a21tRDFCcmliNForWGpud2VFYkZvN0lnbW5Ba3MxYkRxOWhvZ3EvNWlsWC9zRU9ob1o3dUxKenRiZy9OZ25BN3YgYXp1cmV1c2VyQHl1YW5saWFuZ2xpbnV4Cg==
       userAssignedIdentities:
-      - providerID: ${USER_IDENTITY}
+      - providerID: /subscriptions/1c8c4edc-b188-4199-9580-3173033d75f7/resourcegroups/MC_wcct-capz5_wcct-capz5_uksouth/providers/Microsoft.ManagedIdentity/userAssignedIdentities/wcct-capz5-agentpool
       vmSize: Standard_D2s_v3
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -433,7 +446,7 @@ kind: AzureMachineTemplate
 metadata:
   annotations:
     runtime: containerd
-  name: ${CLUSTER_NAME}-md-win
+  name: wcct-capz5-md-win
   namespace: default
 spec:
   template:
@@ -445,14 +458,14 @@ spec:
       image:
         computeGallery:
           gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
-          name: ${GALLERY_IMAGE_NAME:=capi-win-2022-containerd}
-          version: ${IMAGE_VERSION:=latest}
+          name: capi-win-2022-containerd
+          version: latest
       osDisk:
         diskSizeGB: 128
         managedDisk:
           storageAccountType: Premium_LRS
         osType: Windows
-      sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      sshPublicKey: c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFESDRiVzVyVEVENDRjeUhES05MWWgzdVYvb01NUWIwazBQRndoNnJOMlcxZVRkNzBJZW9kczFmMStPQUh0Y0Y4c0R2M2JkTjdtS2xoR2grWGZvNzluZkdHdEVDQTlrMGJ5eElqczc5cW12em9WL0RvRTZJNSt6em8wY1JuamxPUjFVU0ZpZmVIc3dmQkhoc3NpY25UYWczaUpMSlZVWGd6b1E3S1k3QzdRb0s1R1AvSDJ6eW13cGVsTGQ5R0IvcEdVb3JPOEtOTU5URlFsdC9BcUkwaUltUHd2YklEeWVLWUhlSURTUDhaaExaVGJZSjBrdUZrTXpzSVVQcEZnekZnenlxamlvSUVtYWpPSU9PWTd1Ukk2a21tRDFCcmliNForWGpud2VFYkZvN0lnbW5Ba3MxYkRxOWhvZ3EvNWlsWC9zRU9ob1o3dUxKenRiZy9OZ25BN3YgYXp1cmV1c2VyQHl1YW5saWFuZ2xpbnV4Cg==
       userAssignedIdentities:
-      - providerID: ${USER_IDENTITY}
-      vmSize: ${AZURE_NODE_MACHINE_TYPE:-"Standard_D4s_v3"}
+      - providerID: /subscriptions/1c8c4edc-b188-4199-9580-3173033d75f7/resourcegroups/MC_wcct-capz5_wcct-capz5_uksouth/providers/Microsoft.ManagedIdentity/userAssignedIdentities/wcct-capz5-agentpool
+      vmSize: Standard_D4s_v3

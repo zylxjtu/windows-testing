@@ -14,7 +14,7 @@
 
     # other config
     export ARTIFACTS="${PWD}/_artifacts"
-    export CLUSTER_NAME="wcct-capz9"
+    export CLUSTER_NAME="wcct-capz6"
     export IMAGE_SKU="${WINDOWS_SERVER_VERSION:=windows-2022}-containerd-gen1"
 
     export AZURE_SUBSCRIPTION_ID="1c8c4edc-b188-4199-9580-3173033d75f7"

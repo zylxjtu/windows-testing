@@ -414,6 +414,9 @@ metadata:
 spec:
   template:
     spec:
+      additionalTags:
+        AzSecPackAutoConfigReady: "true"
+        azsecpack: nonprod
       dataDisks:
       - diskSizeGB: 256
         lun: 0

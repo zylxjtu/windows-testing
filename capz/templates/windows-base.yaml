@@ -77,11 +77,11 @@ spec:
             $content = $content | Where-Object { $_ -notmatch "^shutdownGracePeriod:" -and $_ -notmatch "^shutdownGracePeriodCriticalPods:" }
             # Append new values at the end
             $content += "shutdownGracePeriod: 1m"
-            $content += "shutdownGracePeriodCriticalPods: 20s"         
+            $content += "shutdownGracePeriodCriticalPods: 20s"
           }
 
           # Write the updated content back to the file
-          $content | Set-Content -Path $configFile -Encoding ascii   
+          $content | Set-Content -Path $configFile -Encoding ascii
 
         path: C:/updateKubeletConfig.ps1
         permissions: "0744"

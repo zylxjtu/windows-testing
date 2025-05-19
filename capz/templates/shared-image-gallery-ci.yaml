@@ -60,19 +60,28 @@ spec:
           containerd-shim-runhcs-v1.exe --version
         path: C:/replace-containerd.ps1
         permissions: "0744"
-      - content: "$ErrorActionPreference = \"Stop\"\n$FileContent = Get-Content -Path
-          \"$env:SYSTEMDRIVE/var/lib/kubelet/kubeadm-flags.env\"\n$kubeAdmArgs = $FileContent.TrimStart('KUBELET_KUBEADM_ARGS=').Trim('\"')\n\n#
-          Set the path to your kubelet config file\n$configFile = \"$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml\"\n$content
-          = Get-Content -Path $configFile\n# Check if NodeLogQuery feature gate was
-          specified for the cluster and if so, also enable it via kubelet config\nif
-          ($kubeAdmArgs.Contains(\"NodeLogQuery=true\")) {\n    $content += \"enableSystemLogQuery:
-          true\"\n}\nif ($kubeAdmArgs.Contains(\"WindowsGracefulNodeShutdown=true\"))
-          {\n  # Remove existing lines that match the settings\n  $content = $content
-          | Where-Object { $_ -notmatch \"^shutdownGracePeriod:\" -and $_ -notmatch
-          \"^shutdownGracePeriodCriticalPods:\" }\n  # Append new values at the end\n
-          \ $content += \"shutdownGracePeriod: 1m\"\n  $content += \"shutdownGracePeriodCriticalPods:
-          20s\"         \n}\n\n# Write the updated content back to the file\n$content
-          | Set-Content -Path $configFile -Encoding ascii   \n"
+      - content: |
+          $ErrorActionPreference = "Stop"
+          $FileContent = Get-Content -Path "$env:SYSTEMDRIVE/var/lib/kubelet/kubeadm-flags.env"
+          $kubeAdmArgs = $FileContent.TrimStart('KUBELET_KUBEADM_ARGS=').Trim('"')
+
+          # Set the path to your kubelet config file
+          $configFile = "$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml"
+          $content = Get-Content -Path $configFile
+          # Check if NodeLogQuery feature gate was specified for the cluster and if so, also enable it via kubelet config
+          if ($kubeAdmArgs.Contains("NodeLogQuery=true")) {
+              $content += "enableSystemLogQuery: true"
+          }
+          if ($kubeAdmArgs.Contains("WindowsGracefulNodeShutdown=true")) {
+            # Remove existing lines that match the settings
+            $content = $content | Where-Object { $_ -notmatch "^shutdownGracePeriod:" -and $_ -notmatch "^shutdownGracePeriodCriticalPods:" }
+            # Append new values at the end
+            $content += "shutdownGracePeriod: 1m"
+            $content += "shutdownGracePeriodCriticalPods: 20s"
+          }
+
+          # Write the updated content back to the file
+          $content | Set-Content -Path $configFile -Encoding ascii
         path: C:/updateKubeletConfig.ps1
         permissions: "0744"
       - content: |

@@ -585,6 +585,9 @@ metadata:
 spec:
   template:
     spec:
+      additionalTags:
+        AzSecPackAutoConfigReady: "true"
+        azsecpack: nonprod
       dataDisks:
       - diskSizeGB: 256
         lun: 0
@@ -620,7 +623,7 @@ spec:
       image:
         computeGallery:
           gallery: ${GALLERY_NAME:=community_gallery}
-          name: ${GALLERY_IMAGE_NAME:=capi-win-2022-containerd}
+          name: ${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}
           resourceGroup: ${AZURE_RESOURCE_GROUP:=cluster-api-gallery}
           subscriptionID: ${AZURE_SUBSCRIPTION_ID:=46678f10-4bbb-447e-98e8-d2829589f2d8}
           version: ${IMAGE_VERSION:=latest}

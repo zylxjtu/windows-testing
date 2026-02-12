@@ -533,6 +533,9 @@ metadata:
 spec:
   template:
     spec:
+      additionalTags:
+        AzSecPackAutoConfigReady: "true"
+        azsecpack: nonprod
       dataDisks:
       - diskSizeGB: 256
         lun: 0
@@ -566,6 +569,12 @@ spec:
     spec:
       identity: UserAssigned
       image:
+        computeGallery:
+          gallery: ClusterAPI1770923619brcd
+          name: yuanliangtest
+          resourceGroup: cluster-api-gallery
+          subscriptionID: 1c8c4edc-b188-4199-9580-3173033d75f7
+          version: 0.3.1770923626
         sharedGallery:
           gallery: SigwinTestingImages
           name: capi-windows-annual-containerd

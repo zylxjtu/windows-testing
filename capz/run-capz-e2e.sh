@@ -8,6 +8,9 @@ set -o functrace
 SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]}")
 SCRIPT_ROOT=$(dirname "${SCRIPT_PATH}")
 export MANAGEMENT_KUBECONFIG="${SCRIPT_ROOT}/management.kubeconfig"
+
+source "${SCRIPT_ROOT}/env.sh"
+
 export CAPZ_DIR="${CAPZ_DIR:-"${GOPATH}/src/sigs.k8s.io/cluster-api-provider-azure"}"
 : "${CAPZ_DIR:?Environment variable empty or not defined.}"
 if [[ ! -d $CAPZ_DIR ]]; then

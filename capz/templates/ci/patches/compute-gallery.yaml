@@ -13,5 +13,5 @@ spec:
           subscriptionID: "${AZURE_SUBSCRIPTION_ID:=46678f10-4bbb-447e-98e8-d2829589f2d8}"
           resourceGroup: "${AZURE_RESOURCE_GROUP:=cluster-api-gallery}"
           gallery: "${GALLERY_NAME:=community_gallery}"
-          name: "${GALLERY_IMAGE_NAME:=capi-win-2022-containerd}"
+          name: "${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}"
           version: "${IMAGE_VERSION:=latest}"

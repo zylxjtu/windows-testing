@@ -468,11 +468,9 @@ spec:
       identity: UserAssigned
       image:
         computeGallery:
-          name: "yuanliangtest"
-          gallery: "ClusterAPI1770923619brcd"
-          subscriptionID: "1c8c4edc-b188-4199-9580-3173033d75f7"
-          resourceGroup: "cluster-api-gallery"
-          version: "0.3.1770923626"
+          name: "${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}"
+          gallery: "ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019"
+          version: "${IMAGE_VERSION:=latest}"
       osDisk:
         cachingType: ReadWrite
         diskSizeGB: 128

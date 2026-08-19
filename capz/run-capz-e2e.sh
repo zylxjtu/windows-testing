@@ -30,7 +30,7 @@ main() {
     export CONTROL_PLANE_MACHINE_COUNT="${AZURE_CONTROL_PLANE_MACHINE_COUNT:-"1"}"
     export WINDOWS_WORKER_MACHINE_COUNT="${WINDOWS_WORKER_MACHINE_COUNT:-"2"}"
     export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2019"}"
-    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v1.7.16/containerd-1.7.16-windows-amd64.tar.gz"}"
+    export WINDOWS_CONTAINERD_URL="${WINDOWS_CONTAINERD_URL:-"https://github.com/containerd/containerd/releases/download/v2.3.3/containerd-1.7.16-windows-amd64.tar.gz"}"
     export GMSA="${GMSA:-""}" 
     export HYPERV="${HYPERV:-""}"
     # Override kubelet maxPods (e.g. Hyper-V Prow jobs set MAX_PODS=20).
@@ -164,6 +164,7 @@ run_capz_e2e_cleanup() {
         log "removing role assignment if the RG is not locked"
         if ! az lock list --resource-group "$CLUSTER_NAME" --output json | jq -e '.[] | select(.level == "CanNotDelete")' > /dev/null; then
             az role assignment delete --ids "$assignmentId" || true
+            az role assignment delete --ids "${storageAssignmentId:-}" || true
         fi
 
         log "deleting cluster"
@@ -288,6 +289,15 @@ create_cluster(){
             sleep 5
         done
         export assignmentId # used in cleanup
+
+        # Grant the workload cluster identity data-plane (read/write) access to the CI storage
+        # account so nodes can download the OOT credential provider artifacts. The account has
+        # public blob access disabled, so anonymous download is not possible.
+        storageAccountId=$(az storage account show -n "${AZURE_STORAGE_ACCOUNT}" --query id --output tsv)
+        until storageAssignmentId=$(az role assignment create --assignee-object-id "${objectId}" --role "Storage Blob Data Contributor" --scope "${storageAccountId}" --assignee-principal-type ServicePrincipal --output json | jq -r .id); do
+            sleep 5
+        done
+        export storageAssignmentId # used in cleanup
 
         log "Install cluster api azure onto management cluster"
         "$TOOLS_BIN_DIR"/clusterctl init --infrastructure azure
@@ -474,6 +484,9 @@ apply_cloud_provider_azure() {
     --set cloudNodeManager.imageName="${CNM_IMAGE_NAME}"
     --set-string cloudControllerManager.imageTag="${IMAGE_TAG_CCM}"
     --set-string cloudNodeManager.imageTag="${IMAGE_TAG_CNM}")
+    if [[ "${WINDOWS_HPC_ARCH:-amd64}" == "arm64" ]]; then
+        CCM_IMG_ARGS+=(--set-string 'cloudNodeManager.windowsNodeSelector.kubernetes\.io/arch=arm64')
+    fi
 
     echo "Installing cloud-provider-azure components via helm"
     "$TOOLS_BIN_DIR"/helm upgrade cloud-provider-azure --install --namespace kube-system --repo https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/master/helm/repo cloud-provider-azure "${CCM_IMG_ARGS[@]}"

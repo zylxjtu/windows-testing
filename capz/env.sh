@@ -2,7 +2,9 @@
     export CONTROL_PLANE_MACHINE_COUNT="1"
     export WINDOWS_WORKER_MACHINE_COUNT="2"
     export WINDOWS_SERVER_VERSION="windows-2025"
-    export WINDOWS_CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v1.7.16/containerd-1.7.16-windows-amd64.tar.gz"
+    export WINDOWS_CONTAINERD_URL="https://wcctagentbakerstorage.blob.core.windows.net/arm64/containerd-2.3.3-windows-arm64.tar.gz"
+    export WINDOWS_HPC_ARCH="arm64"
+    export WINDOWS_HPC_BASE_IMAGE="wcctpublic.azurecr.io/windows-host-process-containers-base-image:v2.0.0-arm64"
     export GMSA="" 
     export HYPERV=""
     export KPNG=""
@@ -23,6 +25,7 @@
     export AZURE_TENANT_ID="72f988bf-86f1-41af-91ab-2d7cd011db47"
     export AZURE_LOCATION="uksouth"
 
+    # worth to sync to latest if local creation of cluster is failing
     export AZURE_CLOUD_PROVIDER_ROOT="${HOME}/git/cloud-provider-azure"
     export CAPZ_DIR="${HOME}/git/cluster-api-provider-azure"
 

@@ -450,25 +450,37 @@ spec:
         set -o nounset
         set -o pipefail
         set -o errexit
-        [[ $(id -u) != 0 ]] && SUDO="sudo" || SUDO=""
 
-        # Run the az login command with managed identity
-        if az login --identity > /dev/null 2>&1; then
-          echo "Logged in Azure with managed identity"
-          echo "Use OOT credential provider"
-          mkdir -p /var/lib/kubelet/credential-provider
-          az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider" -f /var/lib/kubelet/credential-provider/acr-credential-provider --auth-mode login
-          chmod 755 /var/lib/kubelet/credential-provider/acr-credential-provider
-          az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" -f /var/lib/kubelet/credential-provider-config.yaml --auth-mode login
-          chmod 644 /var/lib/kubelet/credential-provider-config.yaml
-        else
-          echo "Using curl to download the OOT credential provider"
-          mkdir -p /var/lib/kubelet/credential-provider
-          curl --retry 10 --retry-delay 5 -w "response status code is %{http_code}" -Lo /var/lib/kubelet/credential-provider/acr-credential-provider "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider"
-          chmod 755 /var/lib/kubelet/credential-provider/acr-credential-provider
-          curl --retry 10 --retry-delay 5 -w "response status code is %{http_code}" -Lo /var/lib/kubelet/credential-provider-config.yaml "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml"
-          chmod 644 /var/lib/kubelet/credential-provider-config.yaml
+        # Download the OOT credential provider artifacts from the CI storage account.
+        # az CLI is not present on the control plane image and the storage account no
+        # longer allows anonymous access, so authenticate directly against IMDS using the
+        # node's user-assigned managed identity and pull the blobs with curl --fail.
+        # The identity must have the "Storage Blob Data Reader" role on ${AZURE_STORAGE_ACCOUNT}.
+        echo "Downloading OOT credential provider using managed identity via IMDS"
+        mkdir -p /var/lib/kubelet/credential-provider
+
+        imds_token=$(curl --retry 10 --retry-delay 5 --fail -sS -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F" \
+          | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+        if [[ -z "$${imds_token}" ]]; then
+          echo "ERROR: failed to obtain an IMDS access token for Azure Storage" >&2
+          exit 1
         fi
+
+        download_blob() {
+          curl --retry 10 --retry-delay 5 --fail -sS \
+            -H "Authorization: Bearer $${imds_token}" \
+            -H "x-ms-version: 2019-12-12" \
+            -o "$2" \
+            "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/$1"
+        }
+
+        download_blob "azure-acr-credential-provider" /var/lib/kubelet/credential-provider/acr-credential-provider
+        chmod 755 /var/lib/kubelet/credential-provider/acr-credential-provider
+
+        download_blob "credential-provider-config.yaml" /var/lib/kubelet/credential-provider-config.yaml
+        chmod 644 /var/lib/kubelet/credential-provider-config.yaml
       owner: root:root
       path: /tmp/oot-cred-provider.sh
       permissions: "0744"
@@ -595,10 +607,8 @@ spec:
       identity: UserAssigned
       image:
         computeGallery:
-          gallery: ${GALLERY_NAME:=community_gallery}
+          gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
           name: ${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}
-          resourceGroup: ${AZURE_RESOURCE_GROUP:=cluster-api-gallery}
-          subscriptionID: ${AZURE_SUBSCRIPTION_ID:=46678f10-4bbb-447e-98e8-d2829589f2d8}
           version: ${IMAGE_VERSION:=latest}
       osDisk:
         cachingType: ReadWrite

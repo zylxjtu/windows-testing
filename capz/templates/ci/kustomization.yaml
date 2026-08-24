@@ -25,13 +25,6 @@ patches:
     kind: KubeadmConfigTemplate
     name: .*-md-win
     namespace: default
-  path: patches/kubeadm-bootstrap-windows-ci.yaml
-- target:
-    group: bootstrap.cluster.x-k8s.io
-    version: v1beta1
-    kind: KubeadmConfigTemplate
-    name: .*-md-win
-    namespace: default
   path: ../patches/oot-credential-provider-win.yaml
 generatorOptions:
   disableNameSuffixHash: true

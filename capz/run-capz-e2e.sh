@@ -43,6 +43,14 @@ main() {
     export HELM_VERSION=v3.15.2
     export TOOLS_BIN_DIR="${TOOLS_BIN_DIR:-$SCRIPT_ROOT/tools/bin}"
     export CONTAINERD_LOGGER="${CONTAINERD_LOGGER:-""}"
+    if [[ "${WINDOWS_HPC_ARCH:-amd64}" == "arm64" ]]; then
+        : "${WINDOWS_KUBERNETES_BIN_URL:?WINDOWS_KUBERNETES_BIN_URL must contain Windows ARM64 Kubernetes binaries.}"
+        : "${WINDOWS_KUBE_PROXY_IMAGE:?WINDOWS_KUBE_PROXY_IMAGE must reference a Windows ARM64 HostProcess image.}"
+        : "${WINDOWS_GALLERY_SUBSCRIPTION_ID:?WINDOWS_GALLERY_SUBSCRIPTION_ID must identify the private ARM64 Compute Gallery subscription.}"
+        : "${WINDOWS_GALLERY_RESOURCE_GROUP:?WINDOWS_GALLERY_RESOURCE_GROUP must identify the private ARM64 Compute Gallery resource group.}"
+        : "${WINDOWS_GALLERY_NAME:?WINDOWS_GALLERY_NAME must identify the private ARM64 Compute Gallery.}"
+        : "${WINDOWS_GALLERY_IMAGE_VERSION:?WINDOWS_GALLERY_IMAGE_VERSION must identify a generalized CAPZ-ready Windows ARM64 image version.}"
+    fi
 
     # other config
     export ARTIFACTS="${ARTIFACTS:-${PWD}/_artifacts}"
@@ -69,6 +77,7 @@ main() {
     prepare_cloud_provider_azure
     create_cluster
     export_workload_cluster_resource_group
+
     apply_workload_configuration
     apply_cloud_provider_azure
     wait_for_nodes
@@ -466,7 +475,11 @@ EOF
     if [[ -n "$CONTAINERD_LOGGER" ]]; then
         kubectl apply -f "${CAPZ_DIR}"/templates/addons/windows/containerd-logging/containerd-logger.yaml
     fi
-    kubectl apply -f "${CAPZ_DIR}"/templates/addons/windows/csi-proxy/csi-proxy.yaml
+    if [[ "${WINDOWS_HPC_ARCH:-amd64}" == "arm64" ]]; then
+        log "skipping CSI Proxy until a Windows ARM64 image is configured"
+    else
+        kubectl apply -f "${CAPZ_DIR}"/templates/addons/windows/csi-proxy/csi-proxy.yaml
+    fi
     kubectl apply -f "${CAPZ_DIR}"/templates/addons/metrics-server/metrics-server.yaml
 }
 
@@ -488,8 +501,15 @@ apply_cloud_provider_azure() {
         CCM_IMG_ARGS+=(--set-string 'cloudNodeManager.windowsNodeSelector.kubernetes\.io/arch=arm64')
     fi
 
-    echo "Installing cloud-provider-azure components via helm"
-    "$TOOLS_BIN_DIR"/helm upgrade cloud-provider-azure --install --namespace kube-system --repo https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/master/helm/repo cloud-provider-azure "${CCM_IMG_ARGS[@]}"
+    local chart_path="${AZURE_CLOUD_PROVIDER_ROOT}/helm/cloud-provider-azure"
+    : "${AZURE_CLOUD_PROVIDER_ROOT:?Environment variable empty or not defined.}"
+    if [[ ! -f "${chart_path}/Chart.yaml" ]]; then
+        echo "Cloud Provider Azure Helm chart not found: ${chart_path}" >&2
+        return 1
+    fi
+
+    echo "Installing cloud-provider-azure components via helm from ${chart_path}"
+    "$TOOLS_BIN_DIR"/helm upgrade cloud-provider-azure --install --namespace kube-system "${chart_path}" "${CCM_IMG_ARGS[@]}"
 }
 
 prepare_cloud_provider_azure() {

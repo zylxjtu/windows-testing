@@ -215,6 +215,41 @@ spec:
           & $scriptPath
         path: C:/setup-registry-structure.ps1
         permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+
+          Stop-Service kubelet -Force
+
+          $$CI_VERSION="${CI_VERSION}"
+          if($$CI_VERSION -ne "")
+          {
+            $$binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
+            $$ci_url="${WINDOWS_KUBERNETES_BIN_URL}"
+            if ($$ci_url -eq "") {
+              Write-Error "WINDOWS_KUBERNETES_BIN_URL must contain Windows ARM64 Kubernetes binaries"
+              exit 1
+            }
+            foreach ( $$binary in $$binaries )
+            {
+              echo "downloading binary: $$ci_url/$$binary.exe"
+              curl.exe --retry 10 --retry-delay 5 "$$ci_url/$$binary.exe" --output "c:/k/$$binary.exe"
+            }
+          }
+
+          # Tag the ARM64 image under the tag CAPZ's kube-proxy manifest expects.
+          ctr.exe -n k8s.io images pull --local ${WINDOWS_KUBE_PROXY_IMAGE}
+          ctr.exe -n k8s.io images tag ${WINDOWS_KUBE_PROXY_IMAGE} "docker.io/sigwindowstools/kube-proxy:${CI_VERSION/+/_}-calico-hostprocess"
+
+          echo "kubeadm version: "
+          kubeadm.exe version -o=short
+          echo "kubectl version: "
+          kubectl.exe version --client=true
+          echo "kubelet version: "
+          kubelet.exe --version
+          echo "kube-proxy version: "
+          kube-proxy.exe --version
+        path: C:/replace-ci-binaries.ps1
+        permissions: "0744"
       joinConfiguration:
         nodeRegistration:
           criSocket: npipe:////./pipe/containerd-containerd
@@ -235,6 +270,7 @@ spec:
       - powershell C:/create-temp-folder.ps1
       - powershell C:/replace-containerd.ps1
       - powershell C:/collect-hns-crashes.ps1
+      - powershell C:/replace-ci-binaries.ps1
       users:
       - groups: Administrators
         name: capi
@@ -247,7 +283,6 @@ metadata:
   labels:
     cni: ${CLUSTER_NAME}-calico
     containerd-logger: enabled
-    csi-proxy: enabled
     metrics-server: enabled
   name: ${CLUSTER_NAME}
   namespace: default

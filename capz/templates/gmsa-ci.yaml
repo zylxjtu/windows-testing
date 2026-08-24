@@ -223,7 +223,11 @@ spec:
           if($$CI_VERSION -ne "")
           {
             $$binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
-            $$ci_url="https://storage.googleapis.com/k8s-release-dev/ci/$$CI_VERSION/bin/windows/amd64"
+            $$ci_url="${WINDOWS_KUBERNETES_BIN_URL}"
+            if ($$ci_url -eq "") {
+              Write-Error "WINDOWS_KUBERNETES_BIN_URL must contain Windows ARM64 Kubernetes binaries"
+              exit 1
+            }
             foreach ( $$binary in $$binaries )
             {
               echo "downloading binary: $$ci_url/$$binary.exe"
@@ -231,11 +235,9 @@ spec:
             }
           }
 
-          # Tag it to the ci version.  The image knows how to use the copy locally with the configmap
-          # that is applied at at this stage (windows-kubeproxy-ci.yaml)
-          # use containerd local service vs transfer service until transfer service stabalizes in containerd 2.0
-          ctr.exe -n k8s.io images pull --local docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess
-          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:${CI_VERSION/+/_}-calico-hostprocess"
+          # Tag the ARM64 image under the tag CAPZ's kube-proxy manifest expects.
+          ctr.exe -n k8s.io images pull --local ${WINDOWS_KUBE_PROXY_IMAGE}
+          ctr.exe -n k8s.io images tag ${WINDOWS_KUBE_PROXY_IMAGE} "docker.io/sigwindowstools/kube-proxy:${CI_VERSION/+/_}-calico-hostprocess"
 
           echo "kubeadm version: "
           kubeadm.exe version -o=short
@@ -302,7 +304,6 @@ metadata:
   labels:
     cni: ${CLUSTER_NAME}-calico
     containerd-logger: enabled
-    csi-proxy: enabled
     metrics-server: enabled
   name: ${CLUSTER_NAME}
   namespace: default
@@ -631,12 +632,16 @@ spec:
       annotations:
         runtime: containerd
     spec:
+      disableVMBootstrapExtension: true
       identity: UserAssigned
       image:
         computeGallery:
-          gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
-          name: ${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}
-          version: ${IMAGE_VERSION:=latest}
+          gallery: ${WINDOWS_GALLERY_NAME}
+          name: ${WINDOWS_GALLERY_IMAGE_NAME}
+          resourceGroup: ${WINDOWS_GALLERY_RESOURCE_GROUP}
+          subscriptionID: ${WINDOWS_GALLERY_SUBSCRIPTION_ID}
+          version: ${WINDOWS_GALLERY_IMAGE_VERSION}
+          vmSize: ${AZURE_NODE_MACHINE_TYPE:-Standard_D4ps_v6}
       osDisk:
         cachingType: ReadWrite
         diskSizeGB: 128

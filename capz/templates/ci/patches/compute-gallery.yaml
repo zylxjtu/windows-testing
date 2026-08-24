@@ -8,10 +8,12 @@ metadata:
 spec:
   template:
     spec:
+      disableVMBootstrapExtension: true
       image:
         computeGallery:
-          # Use the public CAPZ community gallery (same as the Linux control plane image).
-          # A community gallery reference must not include subscriptionID/resourceGroup.
-          gallery: "ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019"
-          name: "${GALLERY_IMAGE_NAME:=capi-win-2025-containerd}"
-          version: "${IMAGE_VERSION:=latest}"
+          subscriptionID: "${WINDOWS_GALLERY_SUBSCRIPTION_ID}"
+          resourceGroup: "${WINDOWS_GALLERY_RESOURCE_GROUP}"
+          gallery: "${WINDOWS_GALLERY_NAME}"
+          name: "${WINDOWS_GALLERY_IMAGE_NAME}"
+          version: "${WINDOWS_GALLERY_IMAGE_VERSION}"
+          vmSize: "${AZURE_NODE_MACHINE_TYPE:-Standard_D4ps_v6}"

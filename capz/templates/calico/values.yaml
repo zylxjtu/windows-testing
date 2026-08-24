@@ -1,6 +1,8 @@
 installation:
   cni:
     type: Calico
+  registry: wcctpublic.azurecr.io/
+  imagePath: calico
   calicoNetwork:
     bgp: Disabled
     mtu: 1350

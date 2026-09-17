@@ -27,6 +27,38 @@ spec:
       - content: |
           $ErrorActionPreference = 'Stop'
           $$CONTAINERD_URL="${WINDOWS_CONTAINERD_URL}"
+
+          function Download-ContainerdArchive($$uri, $$destination) {
+            $$downloadUri = [uri]$$uri
+            $$storageHost = '${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net'
+            $$curlHeaders = @()
+
+            if ($$downloadUri.Host -eq $$storageHost) {
+              $$identityResourceId='${USER_IDENTITY}'
+              if ($$identityResourceId -eq '') {
+                throw 'USER_IDENTITY must identify the worker managed identity.'
+              }
+
+              $$tokenUri='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F&mi_res_id=' + [uri]::EscapeDataString($$identityResourceId)
+              $$accessToken=(Invoke-RestMethod -Headers @{Metadata='true'} -Uri $$tokenUri).access_token
+              if ($$accessToken -eq '') {
+                throw 'Unable to acquire a Storage access token from IMDS.'
+              }
+
+              $$curlHeaders = @('-H', "Authorization: Bearer $$accessToken", '-H', 'x-ms-version: 2023-11-03')
+            }
+
+            curl.exe --fail --retry 10 --retry-delay 5 -L $$uri @curlHeaders --output $$destination
+            if ($$LASTEXITCODE -ne 0) {
+              throw "Failed to download $$uri."
+            }
+
+            $$signature=[System.IO.File]::ReadAllBytes($$destination)[0..1]
+            if ($$signature[0] -ne 0x1F -or $$signature[1] -ne 0x8B) {
+              throw 'Downloaded containerd.tar.gz is not a gzip archive.'
+            }
+          }
+
           if($$CONTAINERD_URL -ne ""){
             # Kubelet service depends on contianerd service so make a best effort attempt to stop it
             Stop-Service kubelet -Force -ErrorAction SilentlyContinue
@@ -45,7 +77,7 @@ spec:
               }
               $$CONTAINERD_URL = $asset.browser_download_url
             }
-            curl.exe --retry 10 --retry-delay 5 -L "$$CONTAINERD_URL" --output "c:/k/containerd.tar.gz"
+            Download-ContainerdArchive $$CONTAINERD_URL 'c:/k/containerd.tar.gz'
             # Log service state and if any files under containerd director are locked
             Get-Service -Name containerd, kubelet
             $dir = "c:/Program Files/containerd"
@@ -219,6 +251,27 @@ spec:
 
           Stop-Service kubelet -Force
 
+          $$identityResourceId='${USER_IDENTITY}'
+          if ($$identityResourceId -eq '') {
+            throw 'USER_IDENTITY must identify the worker managed identity.'
+          }
+
+          $$tokenUri='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F&mi_res_id=' + [uri]::EscapeDataString($$identityResourceId)
+          $$accessToken=(Invoke-RestMethod -Headers @{Metadata='true'} -Uri $$tokenUri).access_token
+          if ($$accessToken -eq '') {
+            throw 'Unable to acquire a Storage access token from IMDS.'
+          }
+
+          function Download-PrivateBlob($$uri, $$destination) {
+            curl.exe --fail --retry 10 --retry-delay 5 -L $$uri `
+              -H "Authorization: Bearer $$accessToken" `
+              -H 'x-ms-version: 2023-11-03' `
+              --output $$destination
+            if ($$LASTEXITCODE -ne 0) {
+              throw "Failed to download $$uri."
+            }
+          }
+
           $$CI_VERSION="${CI_VERSION}"
           if($$CI_VERSION -ne "")
           {
@@ -231,7 +284,13 @@ spec:
             foreach ( $$binary in $$binaries )
             {
               echo "downloading binary: $$ci_url/$$binary.exe"
-              curl.exe --retry 10 --retry-delay 5 "$$ci_url/$$binary.exe" --output "c:/k/$$binary.exe"
+              $$destination="c:/k/$$binary.exe"
+              Download-PrivateBlob "$$ci_url/$$binary.exe" $$destination
+
+              $$signature=[System.IO.File]::ReadAllBytes($$destination)[0..1]
+              if ($$signature[0] -ne 0x4D -or $$signature[1] -ne 0x5A) {
+                throw "Downloaded $$binary.exe is not a Windows executable."
+              }
             }
           }
 
@@ -280,22 +339,32 @@ spec:
       - content: |
           $ErrorActionPreference = 'Stop'
 
-          Write-Host "Attempting to log in to Azure with managed identity"
-          az login --identity > $null 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Logged in Azure with managed identity"
-            Write-Host "Use OOT credential provider"
-            mkdir C:\var\lib\kubelet\credential-provider
-            az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider.exe" -f C:\var\lib\kubelet\credential-provider\acr-credential-provider --auth-mode login
-            cp C:\var\lib\kubelet\credential-provider\acr-credential-provider C:\var\lib\kubelet\credential-provider\acr-credential-provider.exe
-            az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" -f C:\var\lib\kubelet\credential-provider-config.yaml --auth-mode login
-          } else {
-            Write-Host "Using curl to download the OOT credential provider"
-            mkdir C:\var\lib\kubelet\credential-provider
-            curl.exe --retry 10 --retry-delay 5 -L "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider.exe" --output C:\var\lib\kubelet\credential-provider\acr-credential-provider
-            cp C:\var\lib\kubelet\credential-provider\acr-credential-provider C:\var\lib\kubelet\credential-provider\acr-credential-provider.exe
-            curl.exe --retry 10 --retry-delay 5 -L "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" --output C:\var\lib\kubelet\credential-provider-config.yaml
+          $$identityResourceId='${USER_IDENTITY}'
+          if ($$identityResourceId -eq '') {
+            throw 'USER_IDENTITY must identify the worker managed identity.'
           }
+
+          $$tokenUri='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F&mi_res_id=' + [uri]::EscapeDataString($$identityResourceId)
+          $$accessToken=(Invoke-RestMethod -Headers @{Metadata='true'} -Uri $$tokenUri).access_token
+          if ($$accessToken -eq '') {
+            throw 'Unable to acquire a Storage access token from IMDS.'
+          }
+
+          function Download-PrivateBlob($$uri, $$destination) {
+            curl.exe --fail --retry 10 --retry-delay 5 -L $$uri `
+              -H "Authorization: Bearer $$accessToken" `
+              -H 'x-ms-version: 2023-11-03' `
+              --output $$destination
+            if ($$LASTEXITCODE -ne 0) {
+              throw "Failed to download $$uri."
+            }
+          }
+
+          mkdir C:\var\lib\kubelet\credential-provider
+          $$artifactBaseUri="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}"
+          Download-PrivateBlob "$$artifactBaseUri/azure-acr-credential-provider.exe" C:\var\lib\kubelet\credential-provider\acr-credential-provider
+          cp C:\var\lib\kubelet\credential-provider\acr-credential-provider C:\var\lib\kubelet\credential-provider\acr-credential-provider.exe
+          Download-PrivateBlob "$$artifactBaseUri/credential-provider-config.yaml" C:\var\lib\kubelet\credential-provider-config.yaml
         path: C:/oot-cred-provider.ps1
         permissions: "0744"
       joinConfiguration:
@@ -624,7 +693,7 @@ spec:
       sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
       userAssignedIdentities:
       - providerID: ${USER_IDENTITY}
-      vmSize: Standard_D2s_v3
+      vmSize: ${AZURE_CONTROL_PLANE_MACHINE_TYPE:-"Standard_D2s_v3"}
 ---
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: AzureMachineTemplate
@@ -648,7 +717,6 @@ spec:
           resourceGroup: ${WINDOWS_GALLERY_RESOURCE_GROUP}
           subscriptionID: ${WINDOWS_GALLERY_SUBSCRIPTION_ID}
           version: ${WINDOWS_GALLERY_IMAGE_VERSION}
-          vmSize: ${AZURE_NODE_MACHINE_TYPE:-Standard_D4ps_v6}
       osDisk:
         cachingType: ReadWrite
         diskSizeGB: 128

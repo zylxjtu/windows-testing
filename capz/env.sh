@@ -1,4 +1,4 @@
-    export KUBERNETES_VERSION="latest-1.35"
+    export KUBERNETES_VERSION="latest-1.38"
     export CONTROL_PLANE_MACHINE_COUNT="1"
     export WINDOWS_WORKER_MACHINE_COUNT="2"
     export WINDOWS_SERVER_VERSION="windows-2025"
@@ -13,7 +13,7 @@
     export WINDOWS_GALLERY_RESOURCE_GROUP="yuanliang_Arm64_scus"
     export WINDOWS_GALLERY_NAME="Arm64ImageGallery_private"
     export WINDOWS_GALLERY_IMAGE_NAME="yuanliangtest"
-    export WINDOWS_GALLERY_IMAGE_VERSION="0.3.1787349176"
+    export WINDOWS_GALLERY_IMAGE_VERSION="0.3.1791241920"
 
     # the following are the base ARM image used to create the capz image
     # export WINDOWS_GALLERY_RESOURCE_GROUP="yuanliangARM64"
@@ -35,7 +35,7 @@
 
     # other config
     export ARTIFACTS="${PWD}/_artifacts"
-    export CLUSTER_NAME="wcct2-arm64"
+    export CLUSTER_NAME="wcct-arm64"
     export IMAGE_SKU="${WINDOWS_SERVER_VERSION:=windows-2025}-containerd-gen1"
 
     export AZURE_SUBSCRIPTION_ID="1c8c4edc-b188-4199-9580-3173033d75f7"

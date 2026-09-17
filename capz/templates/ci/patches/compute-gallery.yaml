@@ -16,4 +16,3 @@ spec:
           gallery: "${WINDOWS_GALLERY_NAME}"
           name: "${WINDOWS_GALLERY_IMAGE_NAME}"
           version: "${WINDOWS_GALLERY_IMAGE_VERSION}"
-          vmSize: "${AZURE_NODE_MACHINE_TYPE:-Standard_D4ps_v6}"

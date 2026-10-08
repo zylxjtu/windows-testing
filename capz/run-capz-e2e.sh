@@ -153,6 +153,10 @@ run_capz_e2e_cleanup() {
         capz::ci-build-kubernetes::cleanup || true
     fi
 
+    if [[ "${NETWORK_PLUGIN:-}" == "azure-cni" && ! "${SKIP_LOG_COLLECTION:-"false"}" == "true" ]]; then
+        collect_azure_cni_diagnostics || true
+    fi
+
     kubectl get nodes -owide
 
     # currently KUBECONFIG is set to the workload cluster so reset to the management cluster
@@ -878,6 +882,84 @@ azure_cni_local_hns_endpoints(){
         result+="${node}=${count} "
     done < <(kubectl -n kube-system get pods -l k8s-app=azure-cni-windows -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' | sort -k2)
     echo "${result% }"
+}
+
+# Best-effort collection that shows whether a failure came from Azure IP allocation, containerd
+# CNI invocation, HNS network creation, or kube-proxy service routing. Called from the EXIT trap.
+collect_azure_cni_diagnostics(){
+    local dir="${ARTIFACTS}/azure-cni"
+    local template_dir="${AZURE_CNI_TEMPLATE_DIR:-"${SCRIPT_ROOT}/templates/networking/azure-cni"}"
+    local workload_kubeconfig="${SCRIPT_ROOT}/${CLUSTER_NAME:-}.kubeconfig"
+    if [[ -f "${workload_kubeconfig}" ]]; then
+        local -x KUBECONFIG="${workload_kubeconfig}"
+    fi
+    mkdir -p "${dir}"
+    log "collecting Azure CNI diagnostics in ${dir}"
+
+    local resource_group="${AZURE_RESOURCE_GROUP:-"${CLUSTER_NAME:-}"}"
+    az network nic list --resource-group "${resource_group}" \
+        --query "[].{NIC:name,IPConfigs:length(ipConfigurations)}" --output table > "${dir}/nic-ipconfig-counts.txt" 2>&1
+    az network nic list --resource-group "${resource_group}" \
+        --query "[].{nic:name,ipConfigurations:ipConfigurations[].{name:name,privateIPAddress:privateIPAddress,primary:primary,subnet:subnet.id}}" \
+        --output json > "${dir}/nic-ipconfigs.json" 2>&1
+
+    {
+        kubectl get nodes -o wide
+        kubectl -n kube-system get ds,pods -o wide
+        kubectl get pods -A -o wide
+    } > "${dir}/cluster-state.txt" 2>&1
+    kubectl get events -A --sort-by=.lastTimestamp > "${dir}/events.txt" 2>&1
+    kubectl -n kube-system describe daemonset azure-cni azure-cni-windows kube-proxy-windows > "${dir}/daemonsets.txt" 2>&1
+    local app
+    for app in azure-cni azure-cni-windows kube-proxy-windows; do
+        kubectl -n kube-system logs -l "k8s-app=${app}" --all-containers --prefix --tail=-1 > "${dir}/${app}.log" 2>&1
+        kubectl -n kube-system logs -l "k8s-app=${app}" --all-containers --prefix --tail=-1 --previous > "${dir}/${app}-previous.log" 2>&1
+    done
+
+    # HostProcess containers run without pod networking, so this works even when the CNI is broken.
+    local encoded node candidate pod container
+    encoded=$(iconv -f UTF-8 -t UTF-16LE "${template_dir}/addons/collect-azure-cni-diagnostics.ps1" | base64 -w 0)
+    while read -r node; do
+        [[ -z "${node}" ]] && continue
+        pod=""
+        for candidate in "azure-cni-windows idle" "kube-proxy-windows kube-proxy"; do
+            read -r app container <<< "${candidate}"
+            pod=$(kubectl -n kube-system get pods -l "k8s-app=${app}" --field-selector "spec.nodeName=${node},status.phase=Running" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [[ -n "${pod}" ]]; then break; fi
+        done
+        if [[ -z "${pod}" ]]; then
+            echo "no running HostProcess pod found on ${node}; see the CAPZ node logs" > "${dir}/node-${node}.txt"
+            continue
+        fi
+        timeout 300 kubectl -n kube-system exec "${pod}" -c "${container}" -- \
+            C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "${encoded}" \
+            > "${dir}/node-${node}.txt" 2>&1
+    done < <(kubectl get nodes -l kubernetes.io/os=windows -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+
+    write_azure_cni_diagnostics_summary "${dir}"
+}
+
+write_azure_cni_diagnostics_summary(){
+    local dir=$1 matches
+    {
+        echo "== Azure IP allocation (expected ${AZURE_CNI_PRIVATE_IP_CONFIGS:-unknown} IP configurations per NIC)"
+        cat "${dir}/nic-ipconfig-counts.txt"
+        echo
+        echo "== containerd CNI invocation (pod sandbox and network readiness events)"
+        matches=$(grep -E 'FailedCreatePodSandBox|NetworkNotReady|NetworkPluginNotReady|failed to setup network|failed to set up sandbox' "${dir}/events.txt" | tail -n 50)
+        echo "${matches:-none}"
+        echo
+        echo "== Windows nodes (HNS network creation, conflist, IPAM log errors, endpoints)"
+        matches=$(grep -h '^AZURE_CNI_NODE_SUMMARY ' "${dir}"/node-*.txt 2>/dev/null | sed 's/^AZURE_CNI_NODE_SUMMARY //')
+        echo "${matches:-no node summaries collected}"
+        echo
+        echo "== Windows kube-proxy service routing"
+        grep -E 'kube-proxy-windows' "${dir}/cluster-state.txt"
+        matches=$(grep -hiE 'waiting for hns network|error|failed' "${dir}/kube-proxy-windows.log" | tail -n 50)
+        echo "${matches:-no kube-proxy errors logged}"
+    } > "${dir}/summary.txt" 2>&1
+    log "Azure CNI diagnostics summary (${dir}/summary.txt):"
+    cat "${dir}/summary.txt"
 }
 
 apply_cloud_provider_azure() {

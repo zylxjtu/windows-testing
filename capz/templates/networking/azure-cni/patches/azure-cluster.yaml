@@ -1,0 +1,20 @@
+# Pin the address ranges that CAPZ would otherwise default, so run-capz-e2e.sh can
+# verify subnet capacity before provisioning and render the Windows CNI configuration.
+- op: test
+  path: /spec/networkSpec/subnets/0/name
+  value: control-plane-subnet
+- op: add
+  path: /spec/networkSpec/subnets/0/cidrBlocks
+  value:
+  - ${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR:=10.0.0.0/16}
+- op: test
+  path: /spec/networkSpec/subnets/1/name
+  value: node-subnet
+- op: add
+  path: /spec/networkSpec/subnets/1/cidrBlocks
+  value:
+  - ${AZURE_CNI_NODE_SUBNET_CIDR:=10.1.0.0/16}
+- op: add
+  path: /spec/networkSpec/vnet/cidrBlocks
+  value:
+  - ${AZURE_CNI_VNET_CIDR:=10.0.0.0/8}

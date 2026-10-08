@@ -1,0 +1,12 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: AzureMachineTemplate
+metadata:
+  name: ${CLUSTER_NAME}-md-win
+  namespace: default
+spec:
+  template:
+    spec:
+      networkInterfaces:
+      - subnetName: node-subnet
+        # Includes the primary IP configuration; Azure CNI uses the secondary IPs for pods.
+        privateIPConfigs: ${AZURE_CNI_PRIVATE_IP_CONFIGS:=111}

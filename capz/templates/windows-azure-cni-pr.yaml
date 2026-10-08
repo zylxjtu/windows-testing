@@ -1,0 +1,715 @@
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: ${CLUSTER_NAME}-md-win
+  namespace: default
+spec:
+  template:
+    spec:
+      files:
+      - contentFrom:
+          secret:
+            key: worker-node-azure.json
+            name: ${CLUSTER_NAME}-md-win-azure-json
+        owner: root:root
+        path: c:/k/azure.json
+        permissions: "0644"
+      - content: |
+          # /tmp is assumed created and required for upstream e2e tests to pass
+          New-Item -ItemType Directory -Force -Path C:\tmp\
+        path: C:/create-temp-folder.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+          $$CONTAINERD_URL="${WINDOWS_CONTAINERD_URL}"
+          if($$CONTAINERD_URL -ne ""){
+            # Kubelet service depends on contianerd service so make a best effort attempt to stop it
+            Stop-Service kubelet -Force -ErrorAction SilentlyContinue
+            Stop-Service containerd -Force
+            echo "downloading containerd: $$CONTAINERD_URL"
+            # If the URL is set to "latest", we will query the GitHub API for the latest containerd release
+            if ($$CONTAINERD_URL.ToLower() -eq "latest") {
+              # Query GitHub API for latest containerd release for Windows
+              $githubApiUrl = "https://api.github.com/repos/containerd/containerd/releases/latest"
+              Write-Output "Fetching latest containerd release from GitHub..."
+              $releaseInfo = Invoke-RestMethod -Uri $githubApiUrl -UseBasicParsing
+              $asset = $releaseInfo.assets | Where-Object { $_.name -like "*windows-amd64.tar.gz" } | Select-Object -First 1
+              if ($null -eq $asset) {
+                Write-Output "Could not find a Windows containerd release asset in the latest GitHub release."
+                exit 1
+              }
+              $$CONTAINERD_URL = $asset.browser_download_url
+            }
+            curl.exe --retry 10 --retry-delay 5 -L "$$CONTAINERD_URL" --output "c:/k/containerd.tar.gz"
+            # Log service state and if any files under containerd director are locked
+            Get-Service -Name containerd, kubelet
+            $dir = "c:/Program Files/containerd"
+            $files = Get-ChildItem $dir -Recurse
+            Write-Output "Checking if any files under $dir are locked"
+            foreach ($file in $files) {
+                $f = $file.FullName
+                Write-output "$f"
+                $fi = New-Object System.IO.FileInfo $f
+                try {
+                    $fStream = $fi.Open([System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                    if ($fStream) {
+                        $fStream.Close()
+                    }
+                } catch {
+                    Write-Output "Unable to open file: $f"
+                }
+            }
+            Write-Output "Extracting new containerd binaries"
+            tar.exe -zxvf c:/k/containerd.tar.gz -C "c:/Program Files/containerd" --strip-components 1
+            # Recreate containerd service with native file logging
+            Write-Output "Recreating containerd service with native file logging..."
+            $logPath = "\var\log\containerd"
+            if (-Not (Test-Path -Path $logPath -PathType Container)) {
+              Write-Host "Creating log directory: $logPath"
+              New-Item -ItemType Directory -Path $logPath -Force | Out-Null
+            } else {
+              Write-Host "Log directory already exists: $logPath"
+            }
+            $ContainerdCommandLine = '"c:\Program Files\containerd\containerd.exe" --register-service --log-file=c:\var\log\containerd\containerd.log'
+            Write-Output "Containerd command line: $ContainerdCommandLine"
+            # Stop and delete the existing containerd service
+            Stop-Service -Name 'containerd' -Force -ErrorAction SilentlyContinue
+            $null = sc.exe delete containerd
+            # Wait for service to be fully deleted
+            $serviceCreated = $false
+            for ($i = 0; $i -lt 20; $i++) {
+                $service = Get-Service -Name containerd -ErrorAction SilentlyContinue
+                if ($null -eq $service) {
+                    Write-Host "containerd service deleted successfully, recreating with native file logging"
+                    cmd.exe /c $ContainerdCommandLine
+                    Start-Service Containerd
+                    Write-Output "Successfully started containerd service with native file logging"
+                    $serviceCreated = $true
+                    break
+                }
+                else {
+                    Write-Host "Waiting for containerd service to be fully deleted... (attempt $($i + 1)/20)"
+                }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $serviceCreated) {
+                Write-Error "Failed to delete containerd service after 20 attempts"
+            }
+          }
+          # Ensure sandbox_image includes Server 2025 variant for Hyper-V compatibility.
+          # pause:3.10 and 3.10.1 lack a Server 2025 manifest, causing Hyper-V UVMs to boot as
+          # Server 2022. containerd then selects the Server 2025 app image variant (based on host OS),
+          # resulting in HCS_E_IMAGE_MISMATCH when mounting 2025 layers inside a 2022 UVM.
+          # pause:3.10.2 includes Server 2025 and is backward-compatible with 2022.
+          if ("${HYPERV}" -eq "true") {
+            $configPath = "C:\Program Files\containerd\config.toml"
+            $configContent = [System.IO.File]::ReadAllText($configPath)
+            $updated = $$false
+            # Config v2 format (containerd 1.x style): sandbox_image = "registry.k8s.io/pause:X.Y.Z"
+            if ($configContent -match 'sandbox_image\s*=\s*"registry\.k8s\.io/pause:3\.10(\.1)?"') {
+              $configContent = $configContent -replace 'sandbox_image\s*=\s*"registry\.k8s\.io/pause:3\.10(\.1)?"', 'sandbox_image = "registry.k8s.io/pause:3.10.2"'
+              $updated = $$true
+            }
+            # Config v3 format (containerd 2.x style): sandbox = 'registry.k8s.io/pause:X.Y.Z'
+            if ($configContent -match "sandbox\s*=\s*'registry\.k8s\.io/pause:3\.10(\.1)?'") {
+              $configContent = $configContent -replace "sandbox\s*=\s*'registry\.k8s\.io/pause:3\.10(\.1)?'", "sandbox = 'registry.k8s.io/pause:3.10.2'"
+              $updated = $$true
+            }
+            if ($updated) {
+              [System.IO.File]::WriteAllText($configPath, $configContent)
+              Write-Output "Updated sandbox image to pause:3.10.2 for Server 2025 Hyper-V compatibility"
+              # Restart containerd so it picks up the new config and re-pins pause:3.10.2
+              # Note: kubelet is not running yet (this is a preKubeadmCommands script)
+              Restart-Service containerd
+              # Pre-pull pause:3.10.2 so containerd can use it for sandboxes immediately
+              Write-Output "Pre-pulling pause:3.10.2..."
+              ctr.exe -n k8s.io images pull registry.k8s.io/pause:3.10.2
+              Write-Output "Restarted containerd with new sandbox image"
+            }
+          }
+          containerd.exe --version
+          containerd-shim-runhcs-v1.exe --version
+        path: C:/replace-containerd.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = "Stop"
+          $FileContent = Get-Content -Path "$env:SYSTEMDRIVE/var/lib/kubelet/kubeadm-flags.env"
+          $kubeAdmArgs = $FileContent.TrimStart('KUBELET_KUBEADM_ARGS=').Trim('"')
+
+          # Set the path to your kubelet config file
+          $configFile = "$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml"
+          $content = Get-Content -Path $configFile
+          # Check if NodeLogQuery feature gate was specified for the cluster and if so, also enable it via kubelet config
+          if ($kubeAdmArgs.Contains("NodeLogQuery=true")) {
+              $content += "enableSystemLogQuery: true"
+          }
+          if ($kubeAdmArgs.Contains("WindowsGracefulNodeShutdown=true")) {
+            # Remove existing lines that match the settings
+            $content = $content | Where-Object { $_ -notmatch "^shutdownGracePeriod:" -and $_ -notmatch "^shutdownGracePeriodCriticalPods:" }
+            # Append new values at the end
+            $content += "shutdownGracePeriod: 1m"
+            $content += "shutdownGracePeriodCriticalPods: 20s"
+          }
+          # Override kubelet maxPods when MAX_PODS is set (envsubst at apply time).
+          if ("${MAX_PODS}" -ne "") {
+            $content = $content | Where-Object { $_ -notmatch "^maxPods:" }
+            $content += "maxPods: ${MAX_PODS}"
+          }
+
+          # Write the updated content back to the file
+          $content | Set-Content -Path $configFile -Encoding ascii
+        path: C:/updateKubeletConfig.ps1
+        permissions: "0744"
+      - content: |
+          # This script restarts the kubelet service.
+          # It supports both nssm and Windows service configurations,
+          # ensuring a smooth transition between service managers without interruption.
+          # This script will eventually be removed once nssm is no longer used.
+          $scriptPath = "$env:SYSTEMDRIVE/k/RestartKubelet.ps1"
+          if (Test-Path $scriptPath) {
+              Write-Host "Found RestartKubelet.ps1, executing..."
+              & $scriptPath
+          } else {
+              Write-Host "RestartKubelet.ps1 not found. Running fallback command..."
+              & "$env:SYSTEMDRIVE\k\nssm.exe" set kubelet start SERVICE_AUTO_START
+              # Actually restart the running kubelet so config.yaml changes take effect.
+              & "$env:SYSTEMDRIVE\k\nssm.exe" restart kubelet
+          }
+        path: C:/KubeletRestart_nssm_sc.ps1
+        permissions: "0744"
+      - content: |
+          mkdir -Force c:/localdumps
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpCount /t REG_DWORD /d 50 /f
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpType /t REG_DWORD /d 2 /f
+          reg.exe add "HKLM\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps" /V DumpFolder /t REG_EXPAND_SZ /d "c:/LocalDumps" /f
+          # Enable sftp so we can copy crash dump files during log collection of stfp
+          $sshd_config = "$env:ProgramData\ssh\sshd_config"
+          if (-not (Test-Path $sshd_config)) { mkdir -Force $sshd_config }
+          Add-Content -Path $sshd_config "Subsystem sftp              sftp-server.exe"
+          sc.exe stop sshd
+          sc.exe start sshd
+        path: C:/collect-hns-crashes.ps1
+        permissions: "0744"
+      - content: |
+          ${AZURE_SSH_PUBLIC_KEY:=""}
+        owner: root:root
+        path: C:/ProgramData/ssh/administrators_authorized_keys
+        permissions: "0640"
+      - content: |
+          $ErrorActionPreference = 'Continue'
+          $scriptUrl = 'https://raw.githubusercontent.com/kubernetes-sigs/windows-testing/master/scripts/install-registry-structure.ps1'
+          $scriptPath = 'C:/install-registry-structure.ps1'
+          Write-Host "Downloading install-registry-structure.ps1 from GitHub..."
+          curl.exe -sL $scriptUrl -o $scriptPath
+          if (-not (Test-Path $scriptPath)) {
+              Write-Error "Failed to download script from $scriptUrl"
+              exit 1
+          }
+          Write-Host "Running install-registry-structure.ps1..."
+          & $scriptPath
+        path: C:/setup-registry-structure.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+
+          Stop-Service kubelet -Force
+
+          $$KUBE_GIT_VERSION="${KUBE_GIT_VERSION}"
+          if($$KUBE_GIT_VERSION -ne "")
+          {
+            $$binaries=@("kubeadm", "kubectl", "kubelet", "kube-proxy")
+            $$ci_url="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${KUBE_GIT_VERSION}/bin/windows/amd64"
+            foreach ( $$binary in $$binaries )
+            {
+              echo "downloading binary: $$ci_url/$$binary.exe"
+              curl.exe --retry 10 --retry-delay 5 "$$ci_url/$$binary.exe" --output "c:/k/$$binary.exe"
+            }
+          }
+
+          # Tag it to the ci version.  The image knows how to use the copy locally with the configmap
+          # that is applied at at this stage (windows-kubeproxy-ci.yaml)
+          ctr.exe -n k8s.io images pull docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess
+          ctr.exe -n k8s.io images tag docker.io/sigwindowstools/kube-proxy:v1.23.1-calico-hostprocess "docker.io/sigwindowstools/kube-proxy:${CI_VERSION/+/_}-calico-hostprocess"
+
+          kubeadm.exe version -o=short
+          kubectl.exe version --client=true --short=true
+          kubelet.exe --version
+          kube-proxy.exe --version
+        path: C:/replace-pr-binaries.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Attempting to log in to Azure with managed identity"
+          az login --identity > $null 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Logged in Azure with managed identity"
+            Write-Host "Use OOT credential provider"
+            mkdir C:\var\lib\kubelet\credential-provider
+            az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider.exe" -f C:\var\lib\kubelet\credential-provider\acr-credential-provider --auth-mode login
+            cp C:\var\lib\kubelet\credential-provider\acr-credential-provider C:\var\lib\kubelet\credential-provider\acr-credential-provider.exe
+            az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" -f C:\var\lib\kubelet\credential-provider-config.yaml --auth-mode login
+          } else {
+            Write-Host "Using curl to download the OOT credential provider"
+            mkdir C:\var\lib\kubelet\credential-provider
+            curl.exe --retry 10 --retry-delay 5 -L "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider.exe" --output C:\var\lib\kubelet\credential-provider\acr-credential-provider
+            cp C:\var\lib\kubelet\credential-provider\acr-credential-provider C:\var\lib\kubelet\credential-provider\acr-credential-provider.exe
+            curl.exe --retry 10 --retry-delay 5 -L "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" --output C:\var\lib\kubelet\credential-provider-config.yaml
+          }
+        path: C:/oot-cred-provider.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+
+          # Azure delivers traffic for pod IPs on L2Bridge networks only when HNS answers
+          # ARP for remote addresses with this MAC. AKS sets the same value for Azure CNI.
+          $hnsStatePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
+          $remoteArpMac = '12-34-56-78-9a-bc'
+          if (-not (Test-Path $hnsStatePath)) {
+            New-Item -Path $hnsStatePath -Force | Out-Null
+          }
+          $currentArpMac = (Get-ItemProperty -Path $hnsStatePath -ErrorAction SilentlyContinue).SDNRemoteArpMacAddress
+          if ($currentArpMac -ne $remoteArpMac) {
+            Set-ItemProperty -Path $hnsStatePath -Name SDNRemoteArpMacAddress -Value $remoteArpMac
+            Write-Output "Set SDNRemoteArpMacAddress to $remoteArpMac"
+            if ((Get-Service -Name hns).Status -eq 'Running') {
+              Restart-Service -Name hns
+              Write-Output "Restarted HNS to apply SDNRemoteArpMacAddress"
+            }
+          }
+
+          Add-Type -Namespace AzureCniPrepare -Name Hns -MemberDefinition @'
+          [DllImport("vmcompute.dll")]
+          public static extern void HNSCall([MarshalAs(UnmanagedType.LPWStr)] string method, [MarshalAs(UnmanagedType.LPWStr)] string path, [MarshalAs(UnmanagedType.LPWStr)] string request, [MarshalAs(UnmanagedType.LPWStr)] out string response);
+          '@
+
+          function Invoke-HnsRequest([string]$Method, [string]$Path, [string]$Body = '') {
+            $response = ''
+            [AzureCniPrepare.Hns]::HNSCall($Method, $Path, $Body, [ref]$response)
+            $result = $response | ConvertFrom-Json
+            if (-not $result.Success) {
+              throw "HNS $Method $Path failed: $($result.Error)"
+            }
+            return $result.Output
+          }
+
+          # Creating the first L2Bridge network moves the node IP to a new vSwitch and briefly
+          # interrupts host networking. Create it before kubelet starts, as AKS does, so the
+          # first Azure CNI ADD reuses the vSwitch instead of disrupting a running node.
+          $l2BridgeNetworks = @(Invoke-HnsRequest -Method GET -Path '/networks' | Where-Object { $_.Type -eq 'L2Bridge' })
+          if ($l2BridgeNetworks.Count -gt 0) {
+            Write-Output "L2Bridge HNS network already exists: $(($l2BridgeNetworks | ForEach-Object { $_.Name }) -join ', ')"
+          } else {
+            $defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object -Property RouteMetric, InterfaceMetric | Select-Object -First 1
+            if (-not $defaultRoute) {
+              throw 'Could not find the IPv4 default route'
+            }
+            $adapter = Get-NetAdapter -InterfaceIndex $defaultRoute.InterfaceIndex
+            $nodeIP = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress
+            if (-not $nodeIP) {
+              throw "Could not find an IPv4 address on adapter $($adapter.Name)"
+            }
+            Write-Output "Creating L2Bridge HNS network 'ext' on adapter $($adapter.Name) with node IP $nodeIP"
+            $network = @{
+              Name = 'ext'
+              Type = 'L2Bridge'
+              NetworkAdapterName = $adapter.Name
+              Subnets = @(@{ AddressPrefix = '192.168.255.0/30'; GatewayAddress = '192.168.255.1' })
+            } | ConvertTo-Json -Depth 5
+            Invoke-HnsRequest -Method POST -Path '/networks' -Body $network | Out-Null
+            $deadline = (Get-Date).AddMinutes(2)
+            while (-not (Get-NetIPAddress -IPAddress $nodeIP -ErrorAction SilentlyContinue)) {
+              if ((Get-Date) -gt $deadline) {
+                throw "Node IP $nodeIP did not return after creating HNS network 'ext'"
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            Write-Output "Node IP $nodeIP is available after creating HNS network 'ext'"
+          }
+        path: C:/azure-cni-prepare-node.ps1
+        permissions: "0744"
+      - content: |
+          $ErrorActionPreference = 'Stop'
+          $configFile = "$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml"
+          $content = @(Get-Content -Path $configFile | Where-Object { $_ -notmatch '^maxPods:' })
+          $content += 'maxPods: ${AZURE_CNI_MAX_PODS:=110}'
+          $content | Set-Content -Path $configFile -Encoding ascii
+        path: C:/azure-cni-kubelet-config.ps1
+        permissions: "0744"
+      joinConfiguration:
+        nodeRegistration:
+          criSocket: npipe:////./pipe/containerd-containerd
+          kubeletExtraArgs:
+            cloud-provider: external
+            feature-gates: ${NODE_FEATURE_GATES:-""}
+            image-credential-provider-bin-dir: /var/lib/kubelet/credential-provider
+            image-credential-provider-config: /var/lib/kubelet/credential-provider-config.yaml
+            v: "2"
+            windows-priorityclass: ABOVE_NORMAL_PRIORITY_CLASS
+          name: '{{ ds.meta_data["local_hostname"] }}'
+      postKubeadmCommands:
+      - powershell C:/updateKubeletConfig.ps1
+      - powershell C:/azure-cni-kubelet-config.ps1
+      - powershell C:/KubeletRestart_nssm_sc.ps1
+      - powershell C:/setup-registry-structure.ps1
+      preKubeadmCommands:
+      - powershell C:/create-temp-folder.ps1
+      - powershell C:/replace-containerd.ps1
+      - powershell C:/collect-hns-crashes.ps1
+      - powershell C:/replace-pr-binaries.ps1
+      - powershell C:/oot-cred-provider.ps1
+      - powershell C:/azure-cni-prepare-node.ps1
+      users:
+      - groups: Administrators
+        name: capi
+        sshAuthorizedKeys:
+        - ${AZURE_SSH_PUBLIC_KEY:=""}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  labels:
+    containerd-logger: enabled
+    csi-proxy: enabled
+    metrics-server: enabled
+  name: ${CLUSTER_NAME}
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 192.168.0.0/16
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: ${CLUSTER_NAME}-control-plane
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: AzureCluster
+    name: ${CLUSTER_NAME}
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: ${CLUSTER_NAME}-md-win
+  namespace: default
+spec:
+  clusterName: ${CLUSTER_NAME}
+  replicas: ${WINDOWS_WORKER_MACHINE_COUNT:-2}
+  selector: {}
+  template:
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: ${CLUSTER_NAME}-md-win
+      clusterName: ${CLUSTER_NAME}
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: AzureMachineTemplate
+        name: ${CLUSTER_NAME}-md-win
+      version: ${KUBERNETES_VERSION}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  annotations:
+    controlplane.cluster.x-k8s.io/skip-kube-proxy: "true"
+  name: ${CLUSTER_NAME}-control-plane
+  namespace: default
+spec:
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      apiServer:
+        extraArgs:
+          feature-gates: ${API_SERVER_FEATURE_GATES:-""}
+        timeoutForControlPlane: 20m
+      controllerManager:
+        extraArgs:
+          allocate-node-cidrs: "false"
+          cloud-provider: external
+          cluster-name: ${CLUSTER_NAME}
+          v: "4"
+      etcd:
+        local:
+          dataDir: /var/lib/etcddisk/etcd
+          extraArgs:
+            quota-backend-bytes: "8589934592"
+      kubernetesVersion: ci/${CI_VERSION}
+      scheduler:
+        extraArgs:
+          feature-gates: ${SCHEDULER_FEATURE_GATES:-""}
+    diskSetup:
+      filesystems:
+      - device: /dev/disk/azure/scsi1/lun0
+        extraOpts:
+        - -E
+        - lazy_itable_init=1,lazy_journal_init=1
+        filesystem: ext4
+        label: etcd_disk
+      - device: ephemeral0.1
+        filesystem: ext4
+        label: ephemeral0
+        replaceFS: ntfs
+      partitions:
+      - device: /dev/disk/azure/scsi1/lun0
+        layout: true
+        overwrite: false
+        tableType: gpt
+    files:
+    - contentFrom:
+        secret:
+          key: control-plane-azure.json
+          name: ${CLUSTER_NAME}-control-plane-azure-json
+      owner: root:root
+      path: /etc/kubernetes/azure.json
+      permissions: "0644"
+    - content: |
+        #!/bin/bash
+        set -o nounset
+        set -o pipefail
+        set -o errexit
+        if grep -q "NodeLogQuery=true" /var/lib/kubelet/kubeadm-flags.env; then
+          [[ $(id -u) != 0 ]] && SUDO="sudo" || SUDO=""
+          echo "* adding enableSystemLogQuery: true to kubelet config"
+          printf "enableSystemLogQuery: true\n" | $${SUDO} tee --append /var/lib/kubelet/config.yaml
+          $${SUDO} systemctl restart kubelet
+        fi
+      owner: root:root
+      path: /tmp/node-log-query-kubelet-config.sh
+      permissions: "0744"
+    - content: |
+        #!/bin/bash
+
+        set -o nounset
+        set -o pipefail
+        set -o errexit
+
+        CI_VERSION=${CI_VERSION}
+
+        systemctl stop kubelet
+        declare -a BINARIES=("kubeadm" "kubectl" "kubelet")
+        for BINARY in "$${BINARIES[@]}"; do
+          echo "* installing package: $${BINARY} ${KUBE_GIT_VERSION}"
+          curl --retry 10 --retry-delay 5 "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${KUBE_GIT_VERSION}/bin/linux/amd64/$${BINARY}" --output "/usr/bin/$${BINARY}"
+        done
+        systemctl restart kubelet
+
+        # Download image tars from GCS, import into containerd, and retag
+        CI_DIR=/tmp/k8s-ci
+        mkdir -p $$CI_DIR
+        declare -a IMAGES=("kube-apiserver" "kube-controller-manager" "kube-proxy" "kube-scheduler")
+        CONTAINER_EXT="tar"
+        CI_URL="https://storage.googleapis.com/k8s-release-dev/ci/$${CI_VERSION}/bin/linux/amd64"
+        IMAGE_REGISTRY_PREFIX=registry.k8s.io
+        for IMAGE in "$${IMAGES[@]}"; do
+          echo "* downloading package: $$CI_URL/$$IMAGE.$$CONTAINER_EXT"
+          curl --retry 10 --retry-delay 5 "$$CI_URL/$$IMAGE.$$CONTAINER_EXT" --output "$$CI_DIR/$$IMAGE.$$CONTAINER_EXT"
+          ctr -n k8s.io images import "$$CI_DIR/$$IMAGE.$$CONTAINER_EXT" || echo "* ignoring expected 'ctr images import' result"
+          ctr -n k8s.io images tag $$IMAGE_REGISTRY_PREFIX/$$IMAGE-amd64:"$${CI_VERSION//+/_}" $$IMAGE_REGISTRY_PREFIX/$$IMAGE:"$${CI_VERSION//+/_}"
+          ctr -n k8s.io images tag $$IMAGE_REGISTRY_PREFIX/$$IMAGE-amd64:"$${CI_VERSION//+/_}" gcr.io/k8s-staging-ci-images/$$IMAGE:"$${CI_VERSION//+/_}"
+        done
+
+        echo "kubeadm version: $(kubeadm version -o=short)"
+        echo "kubectl version: $(kubectl version --client=true)"
+        echo "kubelet version: $(kubelet --version)"
+      owner: root:root
+      path: /tmp/replace-k8s-binaries.sh
+      permissions: "0744"
+    - content: |
+        #!/bin/bash
+
+        set -o nounset
+        set -o pipefail
+        set -o errexit
+        [[ $(id -u) != 0 ]] && SUDO="sudo" || SUDO=""
+
+        # Run the az login command with managed identity
+        if az login --identity > /dev/null 2>&1; then
+          echo "Logged in Azure with managed identity"
+          echo "Use OOT credential provider"
+          mkdir -p /var/lib/kubelet/credential-provider
+          az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider" -f /var/lib/kubelet/credential-provider/acr-credential-provider --auth-mode login
+          chmod 755 /var/lib/kubelet/credential-provider/acr-credential-provider
+          az storage blob download --blob-url "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml" -f /var/lib/kubelet/credential-provider-config.yaml --auth-mode login
+          chmod 644 /var/lib/kubelet/credential-provider-config.yaml
+        else
+          echo "Using curl to download the OOT credential provider"
+          mkdir -p /var/lib/kubelet/credential-provider
+          curl --retry 10 --retry-delay 5 -w "response status code is %{http_code}" -Lo /var/lib/kubelet/credential-provider/acr-credential-provider "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/azure-acr-credential-provider"
+          chmod 755 /var/lib/kubelet/credential-provider/acr-credential-provider
+          curl --retry 10 --retry-delay 5 -w "response status code is %{http_code}" -Lo /var/lib/kubelet/credential-provider-config.yaml "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_BLOB_CONTAINER_NAME}/${IMAGE_TAG_ACR_CREDENTIAL_PROVIDER}/credential-provider-config.yaml"
+          chmod 644 /var/lib/kubelet/credential-provider-config.yaml
+        fi
+      owner: root:root
+      path: /tmp/oot-cred-provider.sh
+      permissions: "0744"
+    - content: |
+        #!/bin/bash
+        set -o errexit
+        set -o nounset
+        set -o pipefail
+        config=/var/lib/kubelet/config.yaml
+        sed -i '/^maxPods:/d' "$config"
+        echo "maxPods: ${AZURE_CNI_MAX_PODS:=110}" >> "$config"
+        systemctl restart kubelet
+      owner: root:root
+      path: /tmp/azure-cni-kubelet-config.sh
+      permissions: "0744"
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+          feature-gates: ${NODE_FEATURE_GATES:-""}
+          image-credential-provider-bin-dir: /var/lib/kubelet/credential-provider
+          image-credential-provider-config: /var/lib/kubelet/credential-provider-config.yaml
+        name: '{{ ds.meta_data["local_hostname"] }}'
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+          feature-gates: ${NODE_FEATURE_GATES:-""}
+          image-credential-provider-bin-dir: /var/lib/kubelet/credential-provider
+          image-credential-provider-config: /var/lib/kubelet/credential-provider-config.yaml
+        name: '{{ ds.meta_data["local_hostname"] }}'
+    mounts:
+    - - LABEL=etcd_disk
+      - /var/lib/etcddisk
+    postKubeadmCommands:
+    - bash -c /tmp/node-log-query-kubelet-config.sh
+    - bash -c /tmp/azure-cni-kubelet-config.sh
+    preKubeadmCommands:
+    - mkdir -p /var/lib/containerd/tmpmounts
+    - |
+      if ! command -v mdatp >/dev/null 2>&1; then
+        echo "mdatp is not installed; skipping Microsoft Defender exclusion"
+      elif timeout 2m bash -c 'until mdatp health >/dev/null 2>&1; do sleep 2; done'; then
+        mdatp exclusion folder add \
+          --path /var/lib/containerd/tmpmounts \
+          --scope global
+      else
+        echo "mdatp is installed but did not become healthy within 2 minutes; skipping Microsoft Defender exclusion"
+      fi
+    - bash -c /tmp/replace-k8s-binaries.sh
+    - bash -c /tmp/oot-cred-provider.sh
+    useExperimentalRetryJoin: true
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: AzureMachineTemplate
+      name: ${CLUSTER_NAME}-control-plane
+  replicas: ${CONTROL_PLANE_MACHINE_COUNT:-1}
+  version: ${KUBERNETES_VERSION}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: AzureCluster
+metadata:
+  name: ${CLUSTER_NAME}
+  namespace: default
+spec:
+  additionalTags:
+    buildProvenance: ${BUILD_PROVENANCE}
+    creationTimestamp: ${TIMESTAMP}
+    jobName: ${JOB_NAME}
+  identityRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: AzureClusterIdentity
+    name: cluster-identity
+  location: ${AZURE_LOCATION}
+  networkSpec:
+    subnets:
+    - cidrBlocks:
+      - ${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR:=10.0.0.0/16}
+      name: control-plane-subnet
+      role: control-plane
+    - cidrBlocks:
+      - ${AZURE_CNI_NODE_SUBNET_CIDR:=10.1.0.0/16}
+      name: node-subnet
+      natGateway:
+        name: node-natgateway
+      role: node
+    vnet:
+      cidrBlocks:
+      - ${AZURE_CNI_VNET_CIDR:=10.0.0.0/8}
+      name: ${AZURE_VNET_NAME:=${CLUSTER_NAME}-vnet}
+  resourceGroup: ${AZURE_RESOURCE_GROUP:=${CLUSTER_NAME}}
+  subscriptionID: ${AZURE_SUBSCRIPTION_ID}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: AzureClusterIdentity
+metadata:
+  labels:
+    clusterctl.cluster.x-k8s.io/move-hierarchy: "true"
+  name: cluster-identity
+  namespace: default
+spec:
+  allowedNamespaces: {}
+  clientID: ${MANAGEMENT_IDENTITY}
+  resourceID: test-this-doesnt-matter
+  tenantID: ${AZURE_TENANT_ID}
+  type: UserAssignedMSI
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: AzureMachineTemplate
+metadata:
+  name: ${CLUSTER_NAME}-control-plane
+  namespace: default
+spec:
+  template:
+    spec:
+      dataDisks:
+      - diskSizeGB: 256
+        lun: 0
+        nameSuffix: etcddisk
+      identity: UserAssigned
+      image:
+        computeGallery:
+          gallery: ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019
+          name: capi-ubun2-2404
+          version: ${IMAGE_VERSION:=latest}
+      networkInterfaces:
+      - privateIPConfigs: ${AZURE_CNI_PRIVATE_IP_CONFIGS:=111}
+        subnetName: control-plane-subnet
+      osDisk:
+        diskSizeGB: 128
+        osType: Linux
+      sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      userAssignedIdentities:
+      - providerID: ${USER_IDENTITY}
+      vmSize: Standard_D2s_v3
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: AzureMachineTemplate
+metadata:
+  annotations:
+    runtime: containerd
+  name: ${CLUSTER_NAME}-md-win
+  namespace: default
+spec:
+  template:
+    metadata:
+      annotations:
+        runtime: containerd
+    spec:
+      identity: UserAssigned
+      image:
+        computeGallery:
+          gallery: ${GALLERY_NAME:=community_gallery}
+          name: ${GALLERY_IMAGE_NAME:=capi-win-2022-containerd}
+          resourceGroup: ${AZURE_RESOURCE_GROUP:=cluster-api-gallery}
+          subscriptionID: ${AZURE_SUBSCRIPTION_ID:=46678f10-4bbb-447e-98e8-d2829589f2d8}
+          version: ${IMAGE_VERSION:=latest}
+      networkInterfaces:
+      - privateIPConfigs: ${AZURE_CNI_PRIVATE_IP_CONFIGS:=111}
+        subnetName: node-subnet
+      osDisk:
+        cachingType: ReadWrite
+        diskSizeGB: 128
+        managedDisk:
+          storageAccountType: Premium_LRS
+        osType: Windows
+      sshPublicKey: ${AZURE_SSH_PUBLIC_KEY_B64:=""}
+      userAssignedIdentities:
+      - providerID: ${USER_IDENTITY}
+      vmSize: ${AZURE_NODE_MACHINE_TYPE:-"Standard_D4s_v3"}

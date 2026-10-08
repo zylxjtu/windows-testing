@@ -1,0 +1,76 @@
+# Installs classic Azure CNI on Windows nodes. The init container runs
+# install-azure-cni.ps1 from the azure-cni-windows-installer ConfigMap and the pod
+# only becomes Ready after the binaries and conflist were installed and verified.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    k8s-app: azure-cni-windows
+  name: azure-cni-windows
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      k8s-app: azure-cni-windows
+  template:
+    metadata:
+      labels:
+        k8s-app: azure-cni-windows
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\system"
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      initContainers:
+      - name: install-azure-cni
+        image: "${AZURE_CNI_WINDOWS_IMAGE}"
+        imagePullPolicy: IfNotPresent
+        command:
+        - C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+        - -NoLogo
+        - -NoProfile
+        - -NonInteractive
+        - -ExecutionPolicy
+        - Bypass
+        - -Command
+        - '& "$env:CONTAINER_SANDBOX_MOUNT_POINT/scripts/install-azure-cni.ps1"; exit $LASTEXITCODE'
+        env:
+        - name: AZURE_CNI_IMAGE
+          value: "${AZURE_CNI_WINDOWS_IMAGE}"
+        - name: AZURE_CNI_DNS_SERVICE_IP
+          value: "${AZURE_CNI_DNS_SERVICE_IP}"
+        - name: AZURE_CNI_DNS_SEARCH
+          value: "${AZURE_CNI_DNS_SEARCH}"
+        - name: AZURE_CNI_SERVICE_CIDR
+          value: "${AZURE_CNI_SERVICE_CIDR}"
+        - name: AZURE_CNI_OUTBOUNDNAT_EXCEPTIONS
+          value: "${AZURE_CNI_OUTBOUNDNAT_EXCEPTIONS}"
+        - name: AZURE_CNI_ENABLE_DSR
+          value: "${WINDOWS_ENABLE_DSR}"
+        volumeMounts:
+        - mountPath: /scripts
+          name: installer
+      containers:
+      - name: idle
+        image: "${AZURE_CNI_WINDOWS_IMAGE}"
+        command:
+        - C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+        - -NoLogo
+        - -NoProfile
+        - -NonInteractive
+        - -Command
+        - while ($true) { Start-Sleep -Seconds 3600 }
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: windows
+      tolerations:
+      - operator: Exists
+      volumes:
+      - configMap:
+          name: azure-cni-windows-installer
+        name: installer
+  updateStrategy:
+    type: RollingUpdate

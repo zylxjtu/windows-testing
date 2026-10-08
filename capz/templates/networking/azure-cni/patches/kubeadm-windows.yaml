@@ -1,0 +1,100 @@
+# PowerShell in this file must not use ${...} or $$ because clusterctl substitutes them.
+- op: add
+  path: /spec/template/spec/files/-
+  value:
+    content: |
+      $ErrorActionPreference = 'Stop'
+
+      # Azure delivers traffic for pod IPs on L2Bridge networks only when HNS answers
+      # ARP for remote addresses with this MAC. AKS sets the same value for Azure CNI.
+      $hnsStatePath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
+      $remoteArpMac = '12-34-56-78-9a-bc'
+      if (-not (Test-Path $hnsStatePath)) {
+        New-Item -Path $hnsStatePath -Force | Out-Null
+      }
+      $currentArpMac = (Get-ItemProperty -Path $hnsStatePath -ErrorAction SilentlyContinue).SDNRemoteArpMacAddress
+      if ($currentArpMac -ne $remoteArpMac) {
+        Set-ItemProperty -Path $hnsStatePath -Name SDNRemoteArpMacAddress -Value $remoteArpMac
+        Write-Output "Set SDNRemoteArpMacAddress to $remoteArpMac"
+        if ((Get-Service -Name hns).Status -eq 'Running') {
+          Restart-Service -Name hns
+          Write-Output "Restarted HNS to apply SDNRemoteArpMacAddress"
+        }
+      }
+
+      Add-Type -Namespace AzureCniPrepare -Name Hns -MemberDefinition @'
+      [DllImport("vmcompute.dll")]
+      public static extern void HNSCall([MarshalAs(UnmanagedType.LPWStr)] string method, [MarshalAs(UnmanagedType.LPWStr)] string path, [MarshalAs(UnmanagedType.LPWStr)] string request, [MarshalAs(UnmanagedType.LPWStr)] out string response);
+      '@
+
+      function Invoke-HnsRequest([string]$Method, [string]$Path, [string]$Body = '') {
+        $response = ''
+        [AzureCniPrepare.Hns]::HNSCall($Method, $Path, $Body, [ref]$response)
+        $result = $response | ConvertFrom-Json
+        if (-not $result.Success) {
+          throw "HNS $Method $Path failed: $($result.Error)"
+        }
+        return $result.Output
+      }
+
+      # Creating the first L2Bridge network moves the node IP to a new vSwitch and briefly
+      # interrupts host networking. Create it before kubelet starts, as AKS does, so the
+      # first Azure CNI ADD reuses the vSwitch instead of disrupting a running node.
+      $l2BridgeNetworks = @(Invoke-HnsRequest -Method GET -Path '/networks' | Where-Object { $_.Type -eq 'L2Bridge' })
+      if ($l2BridgeNetworks.Count -gt 0) {
+        Write-Output "L2Bridge HNS network already exists: $(($l2BridgeNetworks | ForEach-Object { $_.Name }) -join ', ')"
+      } else {
+        $defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object -Property RouteMetric, InterfaceMetric | Select-Object -First 1
+        if (-not $defaultRoute) {
+          throw 'Could not find the IPv4 default route'
+        }
+        $adapter = Get-NetAdapter -InterfaceIndex $defaultRoute.InterfaceIndex
+        $nodeIP = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress
+        if (-not $nodeIP) {
+          throw "Could not find an IPv4 address on adapter $($adapter.Name)"
+        }
+        Write-Output "Creating L2Bridge HNS network 'ext' on adapter $($adapter.Name) with node IP $nodeIP"
+        $network = @{
+          Name = 'ext'
+          Type = 'L2Bridge'
+          NetworkAdapterName = $adapter.Name
+          Subnets = @(@{ AddressPrefix = '192.168.255.0/30'; GatewayAddress = '192.168.255.1' })
+        } | ConvertTo-Json -Depth 5
+        Invoke-HnsRequest -Method POST -Path '/networks' -Body $network | Out-Null
+        $deadline = (Get-Date).AddMinutes(2)
+        while (-not (Get-NetIPAddress -IPAddress $nodeIP -ErrorAction SilentlyContinue)) {
+          if ((Get-Date) -gt $deadline) {
+            throw "Node IP $nodeIP did not return after creating HNS network 'ext'"
+          }
+          Start-Sleep -Milliseconds 500
+        }
+        Write-Output "Node IP $nodeIP is available after creating HNS network 'ext'"
+      }
+    path: C:/azure-cni-prepare-node.ps1
+    permissions: "0744"
+- op: add
+  path: /spec/template/spec/preKubeadmCommands/-
+  value: powershell C:/azure-cni-prepare-node.ps1
+# Set maxPods in the kubelet config file because kustomize and clusterctl turn a
+# numeric kubeletExtraArgs value into an integer, which the API server rejects.
+- op: add
+  path: /spec/template/spec/files/-
+  value:
+    content: |
+      $ErrorActionPreference = 'Stop'
+      $configFile = "$env:SYSTEMDRIVE/var/lib/kubelet/config.yaml"
+      $content = @(Get-Content -Path $configFile | Where-Object { $_ -notmatch '^maxPods:' })
+      $content += 'maxPods: ${AZURE_CNI_MAX_PODS:=110}'
+      $content | Set-Content -Path $configFile -Encoding ascii
+    path: C:/azure-cni-kubelet-config.ps1
+    permissions: "0744"
+# Run before the existing kubelet restart so the new maxPods value takes effect.
+- op: test
+  path: /spec/template/spec/postKubeadmCommands/0
+  value: powershell C:/updateKubeletConfig.ps1
+- op: test
+  path: /spec/template/spec/postKubeadmCommands/1
+  value: powershell C:/KubeletRestart_nssm_sc.ps1
+- op: add
+  path: /spec/template/spec/postKubeadmCommands/1
+  value: powershell C:/azure-cni-kubelet-config.ps1

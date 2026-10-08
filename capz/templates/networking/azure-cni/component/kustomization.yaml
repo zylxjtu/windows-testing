@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+- path: ../patches/azure-machine-control-plane.yaml
+- path: ../patches/azure-machine-windows.yaml
+- target:
+    group: bootstrap.cluster.x-k8s.io
+    version: v1beta1
+    kind: KubeadmConfigTemplate
+    name: .*-md-win
+    namespace: default
+  path: ../patches/kubeadm-windows.yaml
+- target:
+    group: controlplane.cluster.x-k8s.io
+    version: v1beta1
+    kind: KubeadmControlPlane
+    name: .*-control-plane
+    namespace: default
+  path: ../patches/kubeadm-control-plane.yaml
+- target:
+    group: infrastructure.cluster.x-k8s.io
+    version: v1beta1
+    kind: AzureCluster
+    namespace: default
+  path: ../patches/azure-cluster.yaml

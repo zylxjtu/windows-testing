@@ -22,6 +22,17 @@ fi
 main() {
     local -a post_command=("$@")
 
+    export NETWORK_PLUGIN="${NETWORK_PLUGIN:-"calico"}"
+    case "${NETWORK_PLUGIN}" in
+        calico|azure-cni) ;;
+        *) fail_validation "unsupported NETWORK_PLUGIN=${NETWORK_PLUGIN}; supported values are calico and azure-cni" ;;
+    esac
+    local template_override="${TEMPLATE:-}"
+    if [[ "${NETWORK_PLUGIN}" == "azure-cni" ]]; then
+        # Azure CNI is validated on Windows Server 2022 first.
+        export WINDOWS_SERVER_VERSION="${WINDOWS_SERVER_VERSION:-"windows-2022"}"
+    fi
+
     # defaults
     export KUBERNETES_VERSION="${KUBERNETES_VERSION:-"latest"}"
     export CONTROL_PLANE_MACHINE_COUNT="${AZURE_CONTROL_PLANE_MACHINE_COUNT:-"1"}"
@@ -50,6 +61,11 @@ main() {
     # CI is an environment variable set by a prow job: https://github.com/kubernetes/test-infra/blob/master/prow/jobs.md#job-environment-variables
     export CI="${CI:-""}"
 
+    if [[ "${NETWORK_PLUGIN}" == "azure-cni" ]]; then
+        set_azure_cni_defaults
+        validate_azure_cni_configuration "${template_override}"
+    fi
+
     set_azure_envs
 
     mkdir -p "${ARTIFACTS}"
@@ -69,8 +85,14 @@ main() {
     apply_workload_configuration
     apply_cloud_provider_azure
     wait_for_nodes
+    if [[ "${NETWORK_PLUGIN}" == "azure-cni" ]]; then
+        # Nodes become Ready only after the CNI conflist exists, so the installers have run by now.
+        wait_for_azure_cni_installers
+        apply_windows_kube_proxy
+    fi
     ensure_cloud_provider_taint_on_windows_nodes
     wait_for_windows_machinedeployment
+    if [[ "${NETWORK_PLUGIN}" == "azure-cni" ]]; then validate_azure_cni_smoke; fi
     if [[ ${#post_command[@]} -gt 0 ]]; then
         local exit_code
         log "post command detected; skipping default e2e tests"
@@ -195,7 +217,13 @@ create_cluster(){
        
         # select correct template
         template="$template_root"/"$TEMPLATE"
-        if [[ "${IS_PRESUBMIT}" == "true" ]]; then
+        if [[ "${NETWORK_PLUGIN}" == "azure-cni" ]]; then
+            if [[ "${IS_PRESUBMIT}" == "true" ]]; then
+                template="$SCRIPT_ROOT"/templates/windows-azure-cni-pr.yaml
+            else
+                template="$SCRIPT_ROOT"/templates/windows-azure-cni-ci.yaml
+            fi
+        elif [[ "${IS_PRESUBMIT}" == "true" ]]; then
             template="$template_root"/windows-pr.yaml;
         fi
         if [[ "${GMSA}" == "true" ]]; then
@@ -411,6 +439,20 @@ apply_workload_configuration(){
     log "wait for cluster to stabilize"
     timeout --foreground 300 bash -c "until kubectl get --raw /version --request-timeout 5s > /dev/null 2>&1; do sleep 3; done"
 
+    case "${NETWORK_PLUGIN}" in
+        calico)
+            apply_calico
+            apply_windows_kube_proxy
+            ;;
+        azure-cni)
+            # Windows kube-proxy is applied after the nodes are Ready; see main.
+            apply_azure_cni
+            ;;
+    esac
+    apply_common_addons
+}
+
+apply_calico(){
     log "installing calico"
     "$TOOLS_BIN_DIR"/helm repo add projectcalico https://docs.tigera.io/calico/charts
     kubectl create ns calico-system
@@ -438,23 +480,404 @@ data:
   KUBERNETES_SERVICE_HOST: "${servername}"
   KUBERNETES_SERVICE_PORT: "${port}"
 EOF
+}
 
+apply_windows_kube_proxy(){
     # Only patch up kube-proxy if $WINDOWS_KPNG is unset
-    if [[ -z "$KPNG" ]]; then
-        log "installing kube-proxy for windows"
-        # apply kube-proxy for windows with a version (it doesn't matter what version it is replaced with the patch below)
-        KUBERNETES_VERSION=v1.30.1 "$TOOLS_BIN_DIR"/clusterctl generate yaml --from "${CAPZ_DIR}"/templates/addons/windows/calico/kube-proxy-windows.yaml | kubectl apply -f -
-
-        # A patch is needed to tell kube-proxy to use CI binaries.  This could go away once we have build scripts for kubeproxy HostProcess image.
-        kubectl apply -f "${CAPZ_DIR}"/templates/test/ci/patches/windows-kubeproxy-ci.yaml
-        kubectl rollout restart ds -n kube-system kube-proxy-windows
+    if [[ -n "$KPNG" ]]; then
+        return
     fi
+    log "installing kube-proxy for windows"
+    case "${NETWORK_PLUGIN}" in
+        calico)
+            # apply kube-proxy for windows with a version (it doesn't matter what version it is replaced with the patch below)
+            KUBERNETES_VERSION=v1.30.1 "$TOOLS_BIN_DIR"/clusterctl generate yaml --from "${CAPZ_DIR}"/templates/addons/windows/calico/kube-proxy-windows.yaml | kubectl apply -f -
+
+            # A patch is needed to tell kube-proxy to use CI binaries.  This could go away once we have build scripts for kubeproxy HostProcess image.
+            kubectl apply -f "${CAPZ_DIR}"/templates/test/ci/patches/windows-kubeproxy-ci.yaml
+            kubectl rollout restart ds -n kube-system kube-proxy-windows
+            ;;
+        azure-cni)
+            # Create the CI binary override first so the initial pods already use it.
+            kubectl apply -f "${CAPZ_DIR}"/templates/test/ci/patches/windows-kubeproxy-ci.yaml
+            "$TOOLS_BIN_DIR"/clusterctl generate yaml --from "${AZURE_CNI_TEMPLATE_DIR}"/addons/windows-kube-proxy.yaml | kubectl apply -f -
+            kubectl -n kube-system rollout status daemonset/kube-proxy-windows --timeout=10m
+            ;;
+    esac
+}
+
+apply_common_addons(){
     # apply additional helper manifests (logger etc)
     if [[ -n "$CONTAINERD_LOGGER" ]]; then
         kubectl apply -f "${CAPZ_DIR}"/templates/addons/windows/containerd-logging/containerd-logger.yaml
     fi
     kubectl apply -f "${CAPZ_DIR}"/templates/addons/windows/csi-proxy/csi-proxy.yaml
     kubectl apply -f "${CAPZ_DIR}"/templates/addons/metrics-server/metrics-server.yaml
+}
+
+set_azure_cni_defaults(){
+    export AZURE_CNI_TEMPLATE_DIR="${SCRIPT_ROOT}/templates/networking/azure-cni"
+    # One multi-arch image provides the verified Linux and Windows payloads for a single release.
+    export AZURE_CNI_IMAGE="${AZURE_CNI_IMAGE:-"mcr.microsoft.com/containernetworking/azure-cni:v1.6.35-0@sha256:6af0917268f36b92c08925ddd16759984ad15b4d2e20349ce6cfe51d8a1a0067"}"
+    export AZURE_CNI_WINDOWS_IMAGE="${AZURE_CNI_WINDOWS_IMAGE:-"${AZURE_CNI_IMAGE}"}"
+    export AZURE_CNI_MAX_PODS="${AZURE_CNI_MAX_PODS:-"110"}"
+    if [[ -z "${AZURE_CNI_PRIVATE_IP_CONFIGS:-}" && "${AZURE_CNI_MAX_PODS}" =~ ^[0-9]+$ ]]; then
+        # CAPZ counts the primary IP configuration, and Azure CNI assigns only the secondary IPs to pods.
+        AZURE_CNI_PRIVATE_IP_CONFIGS="$((10#${AZURE_CNI_MAX_PODS} + 1))"
+    fi
+    export AZURE_CNI_PRIVATE_IP_CONFIGS="${AZURE_CNI_PRIVATE_IP_CONFIGS:-}"
+    export AZURE_CNI_VNET_CIDR="${AZURE_CNI_VNET_CIDR:-"10.0.0.0/8"}"
+    export AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR="${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR:-"10.0.0.0/16"}"
+    export AZURE_CNI_NODE_SUBNET_CIDR="${AZURE_CNI_NODE_SUBNET_CIDR:-"10.1.0.0/16"}"
+    export AZURE_CNI_DNS_SEARCH="${AZURE_CNI_DNS_SEARCH:-"svc.cluster.local"}"
+    # Azure CNI names its HNS network after the conflist network name.
+    export WINDOWS_HNS_NETWORK_NAME="${WINDOWS_HNS_NETWORK_NAME:-"azure"}"
+    export WINDOWS_ENABLE_DSR="${WINDOWS_ENABLE_DSR:-"true"}"
+    # CI and presubmit jobs run kube-proxy.exe from KUBEPROXY_PATH; the image provides start.ps1.
+    export WINDOWS_KUBEPROXY_IMAGE="${WINDOWS_KUBEPROXY_IMAGE:-"docker.io/sigwindowstools/kube-proxy:v1.35.0-hostprocess"}"
+    export AZURE_CNI_SMOKE_IMAGE="${AZURE_CNI_SMOKE_IMAGE:-"registry.k8s.io/e2e-test-images/agnhost:2.57@sha256:80658cfc42bff7977efaa188e661631202fdbe810c4e17b2fcc84e2a3ac79298"}"
+}
+
+validate_azure_cni_configuration(){
+    local template_override=$1
+
+    # Fail explicitly for combinations that have not been validated with Azure CNI yet.
+    if [[ "${GMSA}" == "true" ]]; then fail_validation "NETWORK_PLUGIN=azure-cni has not been validated with GMSA"; fi
+    if [[ -n "${KPNG}" ]]; then fail_validation "NETWORK_PLUGIN=azure-cni has not been validated with WINDOWS_KPNG"; fi
+    if [[ "${HYPERV}" == "true" ]]; then fail_validation "NETWORK_PLUGIN=azure-cni has not been validated with HYPERV"; fi
+    if [[ -n "${MAX_PODS}" ]]; then fail_validation "MAX_PODS is not supported with NETWORK_PLUGIN=azure-cni; set AZURE_CNI_MAX_PODS instead"; fi
+    if [[ -n "${template_override}" ]]; then fail_validation "TEMPLATE is not supported with NETWORK_PLUGIN=azure-cni; the Azure CNI CI or PR template is selected automatically"; fi
+    if [[ "${WINDOWS_SERVER_VERSION}" != "windows-2022" ]]; then fail_validation "NETWORK_PLUGIN=azure-cni has only been validated with WINDOWS_SERVER_VERSION=windows-2022"; fi
+    if [[ "${KUBERNETES_VERSION}" =~ ^(v|latest-)?1\.29(\.|$) ]]; then fail_validation "NETWORK_PLUGIN=azure-cni does not support Kubernetes v1.29 templates"; fi
+    if [[ "${WINDOWS_ENABLE_DSR}" != "true" && "${WINDOWS_ENABLE_DSR}" != "false" ]]; then fail_validation "WINDOWS_ENABLE_DSR must be true or false"; fi
+
+    local entry
+    for entry in "AZURE_CNI_MAX_PODS=${AZURE_CNI_MAX_PODS}" "AZURE_CNI_PRIVATE_IP_CONFIGS=${AZURE_CNI_PRIVATE_IP_CONFIGS}" "CONTROL_PLANE_MACHINE_COUNT=${CONTROL_PLANE_MACHINE_COUNT}" "WINDOWS_WORKER_MACHINE_COUNT=${WINDOWS_WORKER_MACHINE_COUNT}"; do
+        if [[ ! "${entry#*=}" =~ ^[1-9][0-9]*$ ]]; then fail_validation "${entry%%=*} must be a positive integer, got '${entry#*=}'"; fi
+    done
+    if (( AZURE_CNI_PRIVATE_IP_CONFIGS < AZURE_CNI_MAX_PODS + 1 )); then
+        fail_validation "AZURE_CNI_PRIVATE_IP_CONFIGS (${AZURE_CNI_PRIVATE_IP_CONFIGS}) must be at least AZURE_CNI_MAX_PODS + 1 ($((AZURE_CNI_MAX_PODS + 1))) because CAPZ counts the primary IP configuration"
+    fi
+    # Azure allows at most 256 IP configurations per network interface on every VM size.
+    if (( AZURE_CNI_PRIVATE_IP_CONFIGS > 256 )); then
+        fail_validation "AZURE_CNI_PRIVATE_IP_CONFIGS (${AZURE_CNI_PRIVATE_IP_CONFIGS}) exceeds the Azure limit of 256 IP configurations per network interface"
+    fi
+
+    local cidr
+    for cidr in "${AZURE_CNI_VNET_CIDR}" "${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}" "${AZURE_CNI_NODE_SUBNET_CIDR}"; do
+        if ! is_ipv4_cidr "${cidr}"; then fail_validation "invalid IPv4 CIDR '${cidr}'"; fi
+    done
+    if cidr_within "${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}" "${AZURE_CNI_NODE_SUBNET_CIDR}" || cidr_within "${AZURE_CNI_NODE_SUBNET_CIDR}" "${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}"; then
+        fail_validation "AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR and AZURE_CNI_NODE_SUBNET_CIDR overlap"
+    fi
+
+    local subnet machines usable required
+    for entry in "control-plane-subnet ${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR} ${CONTROL_PLANE_MACHINE_COUNT}" "node-subnet ${AZURE_CNI_NODE_SUBNET_CIDR} ${WINDOWS_WORKER_MACHINE_COUNT}"; do
+        read -r subnet cidr machines <<< "${entry}"
+        if ! cidr_within "${cidr}" "${AZURE_CNI_VNET_CIDR}"; then
+            fail_validation "${subnet} ${cidr} is not inside AZURE_CNI_VNET_CIDR ${AZURE_CNI_VNET_CIDR}"
+        fi
+        # Azure reserves five addresses per subnet; one extra machine covers a rolling upgrade surge.
+        usable=$(( (1 << (32 - 10#${cidr#*/})) - 5 ))
+        required=$(( (machines + 1) * AZURE_CNI_PRIVATE_IP_CONFIGS ))
+        if (( required > usable )); then
+            fail_validation "${subnet} ${cidr} has ${usable} usable addresses but ${required} are required for $((machines + 1)) machines with ${AZURE_CNI_PRIVATE_IP_CONFIGS} IP configurations each"
+        fi
+        log "${subnet} ${cidr}: ${required} of ${usable} usable addresses required"
+    done
+}
+
+is_ipv4_cidr(){
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+    (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 && 10#${BASH_REMATCH[5]} <= 32 ))
+}
+
+ipv4_to_int(){
+    local IFS=. a b c d
+    read -r a b c d <<< "$1"
+    echo $(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))
+}
+
+cidr_contains_ip(){
+    local network=${1%/*} bits=$((10#${1#*/}))
+    local mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    (( ($(ipv4_to_int "$2") & mask) == ($(ipv4_to_int "${network}") & mask) ))
+}
+
+# Returns success when the first CIDR is entirely inside the second CIDR.
+cidr_within(){
+    (( 10#${1#*/} >= 10#${2#*/} )) && cidr_contains_ip "$2" "${1%/*}"
+}
+
+apply_azure_cni(){
+    log "installing Azure CNI from ${AZURE_CNI_IMAGE}"
+
+    # Linux uses CAPZ's Azure CNI v1 add-on, pinned to the same release as Windows.
+    local linux_manifest="${CAPZ_DIR}/templates/addons/azure-cni-v1.yaml"
+    local image_pattern='mcr\.microsoft\.com/containernetworking/azure-cni:[^[:space:]]+'
+    if [[ "$(grep -cE "${image_pattern}" "${linux_manifest}")" != "1" ]]; then
+        log "ERROR: expected exactly one Azure CNI image in ${linux_manifest}"
+        exit 1
+    fi
+    sed -E "s#${image_pattern}#${AZURE_CNI_IMAGE}#" "${linux_manifest}" | kubectl apply -f -
+
+    log "discovering Windows Azure CNI settings"
+    timeout --foreground 300 bash -c "until kubectl -n kube-system get service kube-dns > /dev/null 2>&1; do sleep 3; done"
+    AZURE_CNI_DNS_SERVICE_IP=$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')
+    AZURE_CNI_SERVICE_CIDR=$(kubectl -n kube-system get configmap kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | awk '$1 == "serviceSubnet:" { gsub(/"/, "", $2); print $2 }')
+    local vnet_cidrs
+    vnet_cidrs=$(kubectl --kubeconfig "${MANAGEMENT_KUBECONFIG}" get azurecluster "${CLUSTER_NAME}" -n default -o jsonpath='{.spec.networkSpec.vnet.cidrBlocks[*]}' 2>/dev/null || true)
+    if [[ -z "${vnet_cidrs}" ]]; then
+        log "AzureCluster VNet CIDR lookup unavailable; using AZURE_CNI_VNET_CIDR=${AZURE_CNI_VNET_CIDR}"
+        vnet_cidrs="${AZURE_CNI_VNET_CIDR}"
+    fi
+    # Pod and node IPs both come from the VNet, so traffic inside it must not be SNATed.
+    AZURE_CNI_OUTBOUNDNAT_EXCEPTIONS="${vnet_cidrs// /,}"
+    if [[ -z "${AZURE_CNI_DNS_SERVICE_IP}" || -z "${AZURE_CNI_SERVICE_CIDR}" ]]; then
+        log "ERROR: could not discover the cluster DNS service IP (${AZURE_CNI_DNS_SERVICE_IP}) or service CIDR (${AZURE_CNI_SERVICE_CIDR})"
+        exit 1
+    fi
+    export AZURE_CNI_DNS_SERVICE_IP AZURE_CNI_SERVICE_CIDR AZURE_CNI_OUTBOUNDNAT_EXCEPTIONS
+    log "Windows Azure CNI: image=${AZURE_CNI_WINDOWS_IMAGE} dns=${AZURE_CNI_DNS_SERVICE_IP} serviceCIDR=${AZURE_CNI_SERVICE_CIDR} outboundNATExceptions=${AZURE_CNI_OUTBOUNDNAT_EXCEPTIONS} dsr=${WINDOWS_ENABLE_DSR}"
+
+    kubectl -n kube-system create configmap azure-cni-windows-installer \
+        --from-file=install-azure-cni.ps1="${AZURE_CNI_TEMPLATE_DIR}"/addons/install-azure-cni.ps1 \
+        --dry-run=client -o yaml | kubectl apply -f -
+    "$TOOLS_BIN_DIR"/clusterctl generate yaml --from "${AZURE_CNI_TEMPLATE_DIR}"/addons/azure-cni-windows.yaml | kubectl apply -f -
+}
+
+wait_for_azure_cni_installers(){
+    log "waiting for the Azure CNI installers"
+    local entry daemonset os expected ready
+    for entry in "azure-cni linux" "azure-cni-windows windows"; do
+        read -r daemonset os <<< "${entry}"
+        expected=$(kubectl get nodes -l "kubernetes.io/os=${os}" -o name | wc -l)
+        if kubectl -n kube-system rollout status "daemonset/${daemonset}" --timeout=10m; then
+            ready=$(kubectl -n kube-system get daemonset "${daemonset}" -o jsonpath='{.status.numberReady}')
+        else
+            ready=""
+        fi
+        if [[ "${ready}" != "${expected}" ]]; then
+            log "ERROR: ${daemonset} is Ready on ${ready:-an unknown number} of ${expected} ${os} node(s)"
+            kubectl -n kube-system get pods -l "k8s-app=${daemonset}" -o wide || true
+            kubectl -n kube-system logs -l "k8s-app=${daemonset}" --all-containers --prefix --tail=-1 || true
+            exit 1
+        fi
+        log "${daemonset} is Ready on ${ready} ${os} node(s)"
+    done
+}
+
+validate_azure_cni_smoke(){
+    if [[ "${AZURE_CNI_SKIP_SMOKE:-"false"}" == "true" ]]; then
+        log "skipping Azure CNI smoke validation"
+        return
+    fi
+    log "running Azure CNI smoke validation"
+    local ns="azure-cni-smoke"
+    local windows_replicas=$((WINDOWS_WORKER_MACHINE_COUNT * 2))
+    local failures=0
+
+    kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: win
+  namespace: ${ns}
+spec:
+  replicas: ${windows_replicas}
+  selector:
+    matchLabels:
+      app: win
+  template:
+    metadata:
+      labels:
+        app: win
+    spec:
+      nodeSelector:
+        kubernetes.io/os: windows
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: win
+      containers:
+      - name: agnhost
+        image: ${AZURE_CNI_SMOKE_IMAGE}
+        args: ["netexec", "--http-port=8080"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux
+  namespace: ${ns}
+  labels:
+    app: linux
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: agnhost
+    image: ${AZURE_CNI_SMOKE_IMAGE}
+    args: ["netexec", "--http-port=8080"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: win
+  namespace: ${ns}
+spec:
+  type: NodePort
+  selector:
+    app: win
+  ports:
+  - port: 80
+    targetPort: 8080
+EOF
+    # The first Windows pod triggers the first Azure CNI ADD and creates the HNS network.
+    kubectl -n "${ns}" rollout status deployment/win --timeout=20m
+    kubectl -n "${ns}" wait --for=condition=Ready pod/linux --timeout=10m
+    kubectl -n "${ns}" get pods -o wide
+
+    azure_cni_smoke_checks "${ns}" || failures=$((failures + 1))
+
+    log "checking that Windows pod churn does not leak HNS endpoints"
+    local before after iteration
+    before=$(azure_cni_local_hns_endpoints)
+    for iteration in $(seq 1 "${AZURE_CNI_SMOKE_CHURN_ITERATIONS:-3}"); do
+        log "pod churn iteration ${iteration}"
+        kubectl -n "${ns}" delete pods -l app=win --wait=true
+        kubectl -n "${ns}" rollout status deployment/win --timeout=10m
+    done
+    for _ in $(seq 1 12); do
+        after=$(azure_cni_local_hns_endpoints)
+        if [[ "${before}" == "${after}" ]]; then break; fi
+        sleep 10
+    done
+    if [[ "${before}" == "${after}" ]]; then
+        log "PASS: local HNS endpoints per node unchanged after churn: ${after}"
+    else
+        log "FAIL: local HNS endpoints per node changed after churn: before=${before} after=${after}"
+        failures=$((failures + 1))
+    fi
+    azure_cni_smoke_checks "${ns}" || failures=$((failures + 1))
+
+    log "checking recovery after restarting Windows kube-proxy"
+    kubectl -n kube-system rollout restart daemonset/kube-proxy-windows
+    kubectl -n kube-system rollout status daemonset/kube-proxy-windows --timeout=10m
+    azure_cni_smoke_checks "${ns}" || failures=$((failures + 1))
+
+    if (( failures > 0 )); then
+        log "ERROR: Azure CNI smoke validation failed in ${failures} phase(s)"
+        kubectl -n "${ns}" get pods,svc,endpointslices -o wide || true
+        exit 1
+    fi
+    kubectl delete namespace "${ns}" --wait=false
+    log "Azure CNI smoke validation passed"
+}
+
+# Runs the connectivity checks against the current smoke pods and returns non-zero on any failure.
+azure_cni_smoke_checks(){
+    local ns=$1 failures=0
+    local -a pods=() ips=() nodes=()
+    local name ip node
+    while read -r name ip node; do
+        pods+=("${name}"); ips+=("${ip}"); nodes+=("${node}")
+    done < <(kubectl -n "${ns}" get pods -l app=win -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | "\(.metadata.name) \(.status.podIP) \(.spec.nodeName)"')
+    if (( ${#pods[@]} == 0 )); then
+        log "FAIL: no running Windows smoke pods"
+        return 1
+    fi
+    local linux_ip control_plane_ip node_port
+    linux_ip=$(kubectl -n "${ns}" get pod linux -o jsonpath='{.status.podIP}')
+    control_plane_ip=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    node_port=$(kubectl -n "${ns}" get service win -o jsonpath='{.spec.ports[0].nodePort}')
+
+    local i node_ip
+    for i in "${!pods[@]}"; do
+        node_ip=$(kubectl get node "${nodes[$i]}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        if [[ "${ips[$i]}" != "${node_ip}" ]] && cidr_contains_ip "${AZURE_CNI_NODE_SUBNET_CIDR}" "${ips[$i]}"; then
+            log "PASS: ${pods[$i]} IP ${ips[$i]} is from node subnet ${AZURE_CNI_NODE_SUBNET_CIDR}"
+        else
+            log "FAIL: ${pods[$i]} IP ${ips[$i]} is not a pod IP from node subnet ${AZURE_CNI_NODE_SUBNET_CIDR}"
+            failures=$((failures + 1))
+        fi
+    done
+    if cidr_contains_ip "${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}" "${linux_ip}"; then
+        log "PASS: linux pod IP ${linux_ip} is from control plane subnet ${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}"
+    else
+        log "FAIL: linux pod IP ${linux_ip} is not from control plane subnet ${AZURE_CNI_CONTROL_PLANE_SUBNET_CIDR}"
+        failures=$((failures + 1))
+    fi
+
+    local source=${pods[0]} same_node="" other_node="" other_node_ip=""
+    for i in "${!pods[@]}"; do
+        if (( i == 0 )); then continue; fi
+        if [[ "${nodes[$i]}" == "${nodes[0]}" && -z "${same_node}" ]]; then same_node=${ips[$i]}; fi
+        if [[ "${nodes[$i]}" != "${nodes[0]}" && -z "${other_node}" ]]; then
+            other_node=${ips[$i]}
+            other_node_ip=$(kubectl get node "${nodes[$i]}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        fi
+    done
+    local service="win.${ns}.svc.cluster.local:80"
+    local -a checks=(
+        "Windows to Windows on the same node|${source}|${same_node}:8080"
+        "Windows to Windows on another node|${source}|${other_node}:8080"
+        "Windows to Linux|${source}|${linux_ip}:8080"
+        "Linux to Windows|linux|${ips[0]}:8080"
+        "Windows DNS and ClusterIP|${source}|${service}"
+        "Linux DNS and ClusterIP|linux|${service}"
+        "Linux to Windows NodePort|linux|$(kubectl get node "${nodes[0]}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'):${node_port}"
+        "Windows to remote Windows NodePort|${source}|${other_node_ip}:${node_port}"
+        "Windows VNet egress to the API server|${source}|${control_plane_ip}:6443"
+        "Windows internet egress|${source}|${AZURE_CNI_SMOKE_EGRESS_TARGET:-"mcr.microsoft.com:443"}"
+    )
+    local check description pod target
+    for check in "${checks[@]}"; do
+        IFS='|' read -r description pod target <<< "${check}"
+        if [[ "${target}" == :* ]]; then
+            if (( WINDOWS_WORKER_MACHINE_COUNT > 1 )); then
+                log "FAIL: ${description}: no Windows smoke pod was scheduled on another node"
+                failures=$((failures + 1))
+            else
+                log "SKIP: ${description}: only one Windows node"
+            fi
+            continue
+        fi
+        azure_cni_smoke_connect "${ns}" "${description}" "${pod}" "${target}" || failures=$((failures + 1))
+    done
+    (( failures == 0 ))
+}
+
+azure_cni_smoke_connect(){
+    local ns=$1 description=$2 pod=$3 target=$4
+    for _ in $(seq 1 12); do
+        if kubectl -n "${ns}" exec "${pod}" -- /agnhost connect --timeout=5s "${target}" > /dev/null 2>&1; then
+            log "PASS: ${description}: ${pod} -> ${target}"
+            return 0
+        fi
+        sleep 10
+    done
+    log "FAIL: ${description}: ${pod} -> ${target}"
+    kubectl -n "${ns}" exec "${pod}" -- /agnhost connect --timeout=5s "${target}" || true
+    return 1
+}
+
+# Prints "node=count" pairs for local (non-remote) HNS endpoints on each Windows node.
+azure_cni_local_hns_endpoints(){
+    local pod node count result=""
+    while read -r pod node; do
+        # shellcheck disable=SC2016 # $_ is a PowerShell variable.
+        count=$(kubectl -n kube-system exec "${pod}" -c idle -- C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoLogo -NoProfile -NonInteractive -Command '@(Get-HnsEndpoint | Where-Object { -not $_.IsRemoteEndpoint }).Count' | tr -d '\r')
+        result+="${node}=${count} "
+    done < <(kubectl -n kube-system get pods -l k8s-app=azure-cni-windows -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' | sort -k2)
+    echo "${result% }"
 }
 
 apply_cloud_provider_azure() {
@@ -757,6 +1180,13 @@ set_azure_envs() {
 log() {
 	local msg=$1
 	echo "$(date -R): $msg"
+}
+
+# Fails before any Azure resources exist, so the cleanup EXIT trap is not needed.
+fail_validation() {
+    log "ERROR: $1"
+    trap - EXIT
+    exit 1
 }
 
 # all test regions must support AvailabilityZones

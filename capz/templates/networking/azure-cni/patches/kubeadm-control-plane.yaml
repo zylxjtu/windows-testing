@@ -1,0 +1,20 @@
+# Set maxPods in the kubelet config file because kustomize and clusterctl turn a
+# numeric kubeletExtraArgs value into an integer, which the API server rejects.
+- op: add
+  path: /spec/kubeadmConfigSpec/files/-
+  value:
+    content: |
+      #!/bin/bash
+      set -o errexit
+      set -o nounset
+      set -o pipefail
+      config=/var/lib/kubelet/config.yaml
+      sed -i '/^maxPods:/d' "$config"
+      echo "maxPods: ${AZURE_CNI_MAX_PODS:=110}" >> "$config"
+      systemctl restart kubelet
+    owner: root:root
+    path: /tmp/azure-cni-kubelet-config.sh
+    permissions: "0744"
+- op: add
+  path: /spec/kubeadmConfigSpec/postKubeadmCommands/-
+  value: bash -c /tmp/azure-cni-kubelet-config.sh

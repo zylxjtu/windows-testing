@@ -1,0 +1,65 @@
+# Windows kube-proxy for classic Azure CNI. It uses the CNI-neutral HostProcess
+# kube-proxy image from sig-windows-tools instead of the Calico-specific image.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    k8s-app: kube-proxy
+  name: kube-proxy-windows
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy-windows
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy-windows
+    spec:
+      serviceAccountName: kube-proxy
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\system"
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      containers:
+      - image: "${WINDOWS_KUBEPROXY_IMAGE}"
+        args: ["$env:CONTAINER_SANDBOX_MOUNT_POINT/kube-proxy/start.ps1"]
+        workingDir: "$env:CONTAINER_SANDBOX_MOUNT_POINT/kube-proxy/"
+        name: kube-proxy
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: WINDOWS_HNS_NETWORK_NAME
+          value: "${WINDOWS_HNS_NETWORK_NAME}"
+        - name: ENABLE_DSR
+          value: "${WINDOWS_ENABLE_DSR}"
+        - name: KUBEPROXY_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: windows-kubeproxy-ci
+              key: KUBEPROXY_PATH
+              optional: true
+        volumeMounts:
+        - mountPath: /var/lib/kube-proxy
+          name: kube-proxy
+      nodeSelector:
+        kubernetes.io/os: windows
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      - operator: Exists
+      volumes:
+      - configMap:
+          name: kube-proxy
+        name: kube-proxy
+  updateStrategy:
+    type: RollingUpdate
